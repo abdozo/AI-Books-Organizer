@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from organizer.database import Library
-from organizer.models import DEFAULT_PROMPT, PREVIOUS_DEFAULT_PROMPT
+from organizer.models import DEFAULT_PROMPT, PREVIOUS_DEFAULT_PROMPTS
 
 
 def test_manual_books_and_entity_changes_are_persisted(tmp_path):
@@ -56,7 +58,8 @@ def test_prompt_and_model_settings_do_not_contain_a_schema_column(tmp_path):
     assert columns == ["key", "value"]
 
 
-def test_existing_database_is_migrated_with_publication_fields(tmp_path):
+@pytest.mark.parametrize("saved_prompt", PREVIOUS_DEFAULT_PROMPTS)
+def test_existing_database_is_migrated_with_publication_fields(tmp_path, saved_prompt):
     database = tmp_path / "library.sqlite3"
     with sqlite3.connect(database) as db:
         db.executescript("""
@@ -72,7 +75,7 @@ def test_existing_database_is_migrated_with_publication_fields(tmp_path):
             );
             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
-        db.execute("INSERT INTO settings VALUES ('prompt', ?)", (PREVIOUS_DEFAULT_PROMPT,))
+        db.execute("INSERT INTO settings VALUES ('prompt', ?)", (saved_prompt,))
 
     library = Library(tmp_path)
     with library.connect() as db:

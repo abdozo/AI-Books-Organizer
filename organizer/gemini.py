@@ -62,12 +62,34 @@ def render_page(path: Path, page_number: int, dpi: int = 160) -> bytes:
         raise GeminiFailure(f"تعذر تجهيز الصفحة {page_number}: {exc}") from exc
 
 
-def render_prompt(template: str, *, file_name: str, page_number: int, max_pages: int, previous: dict[str, Any]) -> str:
+FIELD_LABELS = {
+    "title": "العنوان",
+    "author": "المؤلف",
+    "editor": "المحقق",
+    "publisher": "دار النشر",
+    "publication_year": "سنة النشر",
+    "edition_number": "رقم الطبعة",
+    "volume_number": "رقم المجلد",
+    "topic": "الموضوع",
+}
+
+
+def render_prompt(
+    template: str,
+    *,
+    file_name: str,
+    page_number: int,
+    max_pages: int,
+    previous: dict[str, Any],
+    missing_fields: list[str] | None = None,
+) -> str:
+    missing_labels = [FIELD_LABELS.get(field, field) for field in (missing_fields or [])]
     replacements = {
         "{{file_name}}": file_name,
         "{{page_number}}": str(page_number),
         "{{max_pages}}": str(max_pages),
         "{{previous_results}}": json.dumps(previous, ensure_ascii=False, separators=(",", ":")),
+        "{{missing_fields}}": "، ".join(missing_labels) or "لا توجد حقول ناقصة",
     }
     prompt = template
     for token, value in replacements.items():

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import DEFAULT_PROMPT, PREVIOUS_DEFAULT_PROMPT
+from .models import DEFAULT_PROMPT, PREVIOUS_DEFAULT_PROMPTS
 
 
 ENTITY_FIELDS = {"author", "editor", "publisher", "topic"}
@@ -118,10 +118,11 @@ class Library:
                 if column not in book_columns:
                     db.execute(f"ALTER TABLE books ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
             db.execute("INSERT OR IGNORE INTO settings VALUES ('prompt', ?)", (DEFAULT_PROMPT,))
-            db.execute(
-                "UPDATE settings SET value=? WHERE key='prompt' AND value=?",
-                (DEFAULT_PROMPT, PREVIOUS_DEFAULT_PROMPT),
-            )
+            for previous_prompt in PREVIOUS_DEFAULT_PROMPTS:
+                db.execute(
+                    "UPDATE settings SET value=? WHERE key='prompt' AND value=?",
+                    (DEFAULT_PROMPT, previous_prompt),
+                )
             db.execute("INSERT OR IGNORE INTO settings VALUES ('model', ?)", (DEFAULT_MODEL,))
             now = utc_now()
             db.execute(

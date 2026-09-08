@@ -131,12 +131,14 @@ class ScanManager:
                     return "skipped"
                 self.library.update_scan(scan_id, current_page=page_number)
                 previous = {"values": values, "confidence": scores}
+                missing_fields = [field for field in CATALOG_FIELDS if not values[field]]
                 prompt = render_prompt(
                     prompt_template,
                     file_name=book["file"],
                     page_number=page_number,
                     max_pages=max_pages,
                     previous=previous,
+                    missing_fields=missing_fields,
                 )
                 result = client.extract(render_page(path, page_number), model=model, prompt=prompt)
                 response = result.data
