@@ -106,6 +106,7 @@ def _books_table(books: list[dict[str, Any]]) -> str:
     fields = _visible_fields(books)
     widths = _column_widths(fields)
     grid = [widths["_index"], *(widths[key] for key, _label in fields)]
+    grid_columns = "".join(f'<w:gridCol w:w="{width}"/>' for width in grid)
     header_cells = [_cell("م", width=widths["_index"], header=True, shade="243B5A")]
     header_cells.extend(
         _cell(label, width=widths[key], header=True, shade="243B5A")
@@ -131,7 +132,7 @@ def _books_table(books: list[dict[str, Any]]) -> str:
         '<w:right w:val="single" w:sz="4" w:color="D9D9D9"/>'
         '<w:insideH w:val="single" w:sz="4" w:color="D9D9D9"/>'
         '<w:insideV w:val="single" w:sz="4" w:color="D9D9D9"/>'
-        f'</w:tblBorders></w:tblPr><w:tblGrid>{"".join(f"<w:gridCol w:w=\"{width}\"/>" for width in grid)}</w:tblGrid>{"".join(rows)}</w:tbl>'
+        f'</w:tblBorders></w:tblPr><w:tblGrid>{grid_columns}</w:tblGrid>{"".join(rows)}</w:tbl>'
     )
 
 
