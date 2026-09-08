@@ -538,7 +538,7 @@ class Library:
         day_seconds: float,
         minute_limit: int,
         day_limit: int,
-    ) -> tuple[float, str, int, int]:
+    ) -> tuple[float, str, int, int, int | None]:
         """Atomically reserve an API request across app processes and restarts."""
         if minute_limit < 1 or day_limit < 1:
             raise ValueError("حدود طلبات النموذج غير صالحة")
@@ -571,12 +571,21 @@ class Library:
             wait_seconds = max(minute_wait, day_wait)
             if wait_seconds > 0:
                 window = "day" if day_wait >= minute_wait else "minute"
-                return wait_seconds, window, len(minute_times), len(request_times)
-            db.execute(
+                return wait_seconds, window, len(minute_times), len(request_times), None
+            cursor = db.execute(
                 "INSERT INTO api_request_reservations(model,reserved_at) VALUES (?,?)",
                 (model, reserved_at),
             )
-            return 0.0, "", len(minute_times) + 1, len(request_times) + 1
+            return 0.0, "", len(minute_times) + 1, len(request_times) + 1, int(cursor.lastrowid)
+
+    def complete_api_request(self, reservation_id: int, *, completed_at: float) -> None:
+        """Keep a request counted until at least the time its response completed."""
+        with self.transaction() as db:
+            db.execute(
+                """UPDATE api_request_reservations
+                   SET reserved_at=MAX(reserved_at, ?) WHERE id=?""",
+                (completed_at, reservation_id),
+            )
 
     def latest_scan(self) -> dict[str, Any] | None:
         with self.connect() as db:

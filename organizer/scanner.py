@@ -7,7 +7,7 @@ from typing import Any
 
 from .database import Library
 from .gemini import MAX_INLINE_IMAGE_BYTES, GeminiCataloguer, render_page, render_prompt
-from .rate_limits import PersistentRateLimiter
+from .rate_limits import PersistentRateLimiter, RateLimitReservation
 from .secrets import SecretStore
 
 
@@ -55,7 +55,11 @@ class ScanManager:
                 return True
             time.sleep(0.25)
 
-    def _wait_for_api_slot(self, scan_id: str, model: str) -> bool:
+    def _wait_for_api_slot(
+        self,
+        scan_id: str,
+        model: str,
+    ) -> RateLimitReservation | None:
         """Wait for this model's rolling minute or day quota."""
         while True:
             reservation = self._rate_limiter.reserve(model)
@@ -71,7 +75,7 @@ class ScanManager:
                     rate_limit_window="",
                     **limit_fields,
                 )
-                return True
+                return reservation
             deadline = time.monotonic() + delay
             self.library.update_scan(
                 scan_id,
@@ -83,10 +87,10 @@ class ScanManager:
                 control = self._control(scan_id)
                 if control["cancelRequested"] or control["skipRequested"]:
                     self.library.update_scan(scan_id, buffer_until=0, rate_limit_window="")
-                    return False
+                    return None
                 if control["paused"] and not self._wait_if_paused(scan_id):
                     self.library.update_scan(scan_id, buffer_until=0, rate_limit_window="")
-                    return False
+                    return None
                 time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
     def _run(self, scan_id: str) -> None:
@@ -201,14 +205,18 @@ class ScanManager:
                 previous=previous,
                 missing_fields=missing_fields,
             )
-            if not self._wait_for_api_slot(scan_id, model):
+            reservation = self._wait_for_api_slot(scan_id, model)
+            if reservation is None:
                 control = self._control(scan_id)
                 if control["skipRequested"]:
                     self.library.mark_book_skipped(book_id, max_pages)
                     self.library.update_scan(scan_id, skip_requested=0)
                     return "skipped"
                 return "waiting"
-            result = client.extract(images, model=model, prompt=prompt)
+            try:
+                result = client.extract(images, model=model, prompt=prompt)
+            finally:
+                self._rate_limiter.complete(reservation)
             response = result.data
             for field in CATALOG_FIELDS:
                 candidate = getattr(response, field)

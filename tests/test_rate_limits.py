@@ -109,3 +109,26 @@ def test_atomic_reservations_do_not_exceed_the_safe_limit(tmp_path):
 
     assert waits.count(0) == 4
     assert waits.count(60) == 4
+
+
+def test_completed_requests_keep_their_slots_from_expiring_before_google_saw_them(tmp_path):
+    now = [400_000.0]
+    limiter = PersistentRateLimiter(Library(tmp_path), clock=lambda: now[0])
+
+    reservations = [limiter.reserve("gemini-3.5-flash-lite") for _ in range(14)]
+    assert all(reservation.wait_seconds == 0 for reservation in reservations)
+
+    # Google can receive a large upload after the app reserved its slot. Keep
+    # counting the attempt from completion, which is known to occur after arrival.
+    now[0] += 0.8
+    for reservation in reservations:
+        limiter.complete(reservation)
+
+    now[0] = 400_060.0
+    blocked = limiter.reserve("gemini-3.5-flash-lite")
+
+    assert blocked.wait_seconds == pytest.approx(0.8)
+    assert blocked.window == "minute"
+
+    now[0] = 400_060.8
+    assert limiter.reserve("gemini-3.5-flash-lite").wait_seconds == 0

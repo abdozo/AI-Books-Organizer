@@ -40,6 +40,7 @@ class RateLimitReservation:
     requests_per_day: int
     minute_requests_used: int
     day_requests_used: int
+    reservation_id: int | None = None
 
 
 # Limits supplied in the Google AI Studio CSV. The number to the right of each
@@ -92,7 +93,13 @@ class PersistentRateLimiter:
         """Reserve one API attempt, or return when a safe slot will be available."""
         quota = quota_for(model)
         now = self._clock()
-        wait_seconds, window, minute_used, day_used = self._library.reserve_api_request(
+        (
+            wait_seconds,
+            window,
+            minute_used,
+            day_used,
+            reservation_id,
+        ) = self._library.reserve_api_request(
             model,
             reserved_at=now,
             minute_seconds=MINUTE_SECONDS,
@@ -108,4 +115,14 @@ class PersistentRateLimiter:
             requests_per_day=quota.requests_per_day,
             minute_requests_used=minute_used,
             day_requests_used=day_used,
+            reservation_id=reservation_id,
+        )
+
+    def complete(self, reservation: RateLimitReservation) -> None:
+        """Move a used slot forward to response completion to cover network delay."""
+        if reservation.reservation_id is None:
+            return
+        self._library.complete_api_request(
+            reservation.reservation_id,
+            completed_at=self._clock(),
         )

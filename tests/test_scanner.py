@@ -20,6 +20,7 @@ class FakeLibrary:
         self.paused = False
         self.scan_updates = []
         self.api_reservations = 0
+        self.api_completions = 0
 
     def get_book(self, _book_id: str):
         return {**self.book, "status": "complete"}
@@ -47,7 +48,10 @@ class FakeLibrary:
 
     def reserve_api_request(self, _model: str, **_kwargs):
         self.api_reservations += 1
-        return 0.0, "", 1, 1
+        return 0.0, "", 1, 1, self.api_reservations
+
+    def complete_api_request(self, _reservation_id: int, **_kwargs):
+        self.api_completions += 1
 
 
 def extraction(values: dict[str, str]):
@@ -77,7 +81,7 @@ def test_daily_wait_is_reported_and_skip_stays_responsive():
         day_requests_used=20,
     ))
 
-    assert manager._wait_for_api_slot("scan-1", "gemini-3.8-flash") is False
+    assert manager._wait_for_api_slot("scan-1", "gemini-3.8-flash") is None
     first_update = library.scan_updates[0]
     assert first_update["buffer_until"] > 0
     assert {key: value for key, value in first_update.items() if key != "buffer_until"} == {
@@ -116,6 +120,7 @@ def test_scan_sends_all_selected_pages_in_one_reserved_request(monkeypatch):
     assert outcome == "complete"
     assert calls == [[1, 2, 3, 4, 5]]
     assert library.api_reservations == 1
+    assert library.api_completions == 1
     assert library.book["publication_year"] == "٢٠٢٦"
     assert library.book["edition_number"] == "الثانية"
     assert library.book["volume_number"] == ""
@@ -150,6 +155,30 @@ def test_scan_uses_the_actual_pdf_page_count_when_it_is_below_the_user_limit(mon
 
     assert calls == [[1, 2]]
     assert library.api_reservations == 1
+    assert library.api_completions == 1
+
+
+def test_failed_api_attempt_keeps_its_rate_limit_slot(monkeypatch):
+    library = FakeLibrary()
+    manager = ScanManager(library, SimpleNamespace())
+
+    monkeypatch.setattr(
+        "organizer.scanner.render_page",
+        lambda _path, page, **_kwargs: str(page).encode(),
+    )
+
+    class Client:
+        def extract(self, _images, **_kwargs):
+            raise RuntimeError("Google rejected the request")
+
+    outcome = manager._scan_book(
+        "scan-1", "book-1", max_pages=1, prompt_template="{{previous_results}}",
+        model="gemini-3.8-flash", client=Client(),
+    )
+
+    assert outcome == "failed"
+    assert library.api_reservations == 1
+    assert library.api_completions == 1
 
 
 def test_scan_error_identifies_the_book_file(monkeypatch):
