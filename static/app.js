@@ -1,0 +1,739 @@
+(() => {
+  "use strict";
+
+  const $ = (selector) => document.querySelector(selector);
+  const $$ = (selector) => [...document.querySelectorAll(selector)];
+  const esc = (value) => String(value ?? "").replace(/[&<>"]/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
+  })[char]);
+
+  const fields = [
+    ["title", "العنوان"],
+    ["author", "المؤلف"],
+    ["editor", "المحقق"],
+    ["publisher", "دار النشر"],
+    ["publication_year", "سنة النشر"],
+    ["edition_number", "رقم الطبعة"],
+    ["volume_number", "رقم المجلد"],
+    ["topic", "الموضوع"],
+  ];
+  const geminiModels = [
+    { value: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash Lite", dailyRequests: 500 },
+    { value: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash Lite", dailyRequests: 500 },
+    { value: "gemini-3.8-flash", label: "Gemini 3.8 Flash", dailyRequests: 20 },
+    { value: "gemini-3.5-flash", label: "Gemini 3.5 Flash", dailyRequests: 20 },
+    { value: "gemini-3.7-flash", label: "Gemini 3.7 Flash", dailyRequests: 20 },
+    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash", dailyRequests: 20 },
+    { value: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite", dailyRequests: 20 },
+    { value: "gemini-3-flash-preview", label: "Gemini 3 Flash", dailyRequests: 20 },
+    { value: "gemini-3.6-flash", label: "Gemini 3.6 Flash", dailyRequests: 20 },
+  ];
+  const entityTypes = {
+    authors: { key: "author", title: "المؤلفون", singular: "المؤلف" },
+    topics: { key: "topic", title: "الموضوعات", singular: "الموضوع" },
+    publishers: { key: "publisher", title: "دور النشر", singular: "دار النشر" },
+    editors: { key: "editor", title: "المحققون", singular: "المحقق" },
+  };
+  const detailEntityRoutes = {
+    author: "authors", editor: "editors", publisher: "publishers", topic: "topics",
+  };
+
+  const state = {
+    books: [],
+    scan: null,
+    settings: { prompt: "", model: "gemini-3.5-flash-lite", keySaved: false },
+    libraryLabel: "المكتبة المحلية",
+    route: "books",
+    query: "",
+    statuses: new Set(),
+    topic: "all",
+    author: "all",
+    publisher: "all",
+    sort: "recent",
+    page: 1,
+    pageSize: 8,
+    editingId: null,
+    rescanId: null,
+    entityType: "authors",
+    entityQuery: "",
+    entityPage: 1,
+    entityPageSize: 10,
+    selectedEntities: new Set(),
+    entityAction: "",
+    entityMode: "merge",
+    uploading: false,
+  };
+  let pendingFolder = "";
+  let pendingFiles = [];
+  let pollTimer = null;
+
+  async function api(path, options = {}) {
+    const response = await fetch(path, options);
+    const contentType = response.headers.get("content-type") || "";
+    const payload = contentType.includes("application/json") ? await response.json() : null;
+    if (!response.ok) {
+      throw new Error(payload?.detail || `تعذر تنفيذ الطلب (${response.status})`);
+    }
+    return payload;
+  }
+
+  async function refreshData(renderPage = true) {
+    const data = await api("/api/bootstrap");
+    state.books = data.books;
+    state.scan = data.scan;
+    state.settings = data.settings;
+    state.libraryLabel = data.libraryLabel;
+    if (renderPage) render();
+    schedulePoll();
+  }
+
+  function schedulePoll() {
+    clearTimeout(pollTimer);
+    if (state.scan && ["queued", "running"].includes(state.scan.state)) {
+      pollTimer = setTimeout(async () => {
+        try {
+          await refreshData(state.route === "scan" || state.route.startsWith("book/"));
+          if (state.route !== "scan" && !state.route.startsWith("book/")) renderChrome();
+        } catch (error) {
+          toast("تعذر تحديث الفحص", error.message, "error");
+          schedulePoll();
+        }
+      }, 900);
+    }
+  }
+
+  function go(route) {
+    location.hash = `#/${route}`;
+  }
+
+  function parseRoute() {
+    const value = location.hash.replace(/^#\//, "") || "books";
+    const root = value.split("/")[0];
+    if (entityTypes[root] && state.entityType !== root) {
+      state.entityType = root;
+      state.entityQuery = "";
+      state.entityPage = 1;
+      state.entityAction = "";
+      state.selectedEntities.clear();
+    }
+    state.route = value;
+    render();
+  }
+
+  function currentBook() {
+    const id = state.route.split("/")[1];
+    return state.books.find((book) => book.id === id);
+  }
+
+  function statusLabel(status) {
+    return {
+      complete: "مكتمل",
+      review: "يحتاج مراجعة",
+      failed: "تعذر الفحص",
+      current: "قيد الفحص",
+      waiting: "ينتظر",
+      skipped: "تم التخطي",
+    }[status] || status;
+  }
+
+  function statusClass(status) {
+    if (status === "complete") return "complete";
+    if (["review", "waiting", "current"].includes(status)) return "review";
+    return "failed";
+  }
+
+  function formatDate(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return new Intl.DateTimeFormat("ar-EG", { dateStyle: "medium", timeStyle: "short" }).format(date);
+  }
+
+  function listValues(key) {
+    return [...new Set(state.books.map((book) => book[key]).filter(Boolean))]
+      .sort((a, b) => a.localeCompare(b, "ar"));
+  }
+
+  function filteredBooks() {
+    const query = state.query.toLowerCase();
+    const books = state.books.filter((book) => {
+      const text = fields.map(([key]) => book[key]).join(" ").toLowerCase();
+      return (!query || text.includes(query))
+        && (!state.statuses.size || state.statuses.has(statusClass(book.status)))
+        && (state.topic === "all" || book.topic === state.topic)
+        && (state.author === "all" || book.author === state.author)
+        && (state.publisher === "all" || book.publisher === state.publisher);
+    });
+    if (state.sort === "title") books.sort((a, b) => a.title.localeCompare(b.title, "ar"));
+    if (state.sort === "author") books.sort((a, b) => a.author.localeCompare(b.author, "ar"));
+    return books;
+  }
+
+  function render() {
+    renderChrome();
+    const root = state.route.split("/")[0];
+    if (state.route === "books") renderBooks();
+    else if (state.route === "scan") renderScan();
+    else if (state.route === "settings") renderSettings();
+    else if (entityTypes[root]) {
+      state.entityType = root;
+      state.route.includes("/") ? renderEntityDetail() : renderEntities();
+    } else if (state.route.startsWith("book/")) renderDetail();
+    else go("books");
+  }
+
+  function renderChrome() {
+    const scan = state.scan;
+    const running = scan && ["queued", "running"].includes(scan.state);
+    const done = scan?.items?.filter((item) => ["complete", "review", "failed", "skipped"].includes(item.state)).length || 0;
+    const root = state.route.split("/")[0];
+    $("#booksBadge").textContent = state.books.length;
+    $("#scanBadge").textContent = running ? Math.max(0, scan.items.length - done) : 0;
+    $("#scanBadge").classList.toggle("live", Boolean(running));
+    $("#scanIndicator").classList.toggle("idle", !running);
+    $("#scanIndicatorText").textContent = running
+      ? (scan.paused ? "الفحص متوقف مؤقتًا" : `فحص ${Math.min(done + 1, scan.items.length)} من ${scan.items.length}`)
+      : "لا يوجد فحص جارٍ";
+    $("#sidebarPath").textContent = state.libraryLabel;
+    $$("[data-route]").forEach((button) => {
+      button.classList.toggle("active", root === button.dataset.route || (button.dataset.route === "books" && root === "book"));
+    });
+    $("#crumbs").textContent = state.route === "books" ? "الكتب"
+      : state.route === "scan" ? "الفحص"
+        : state.route === "settings" ? "الإعدادات"
+          : entityTypes[root] ? entityTypes[root].title : "الكتب / تفاصيل الكتاب";
+  }
+
+  function bookRow(book) {
+    const publication = [
+      book.publication_year && `السنة: ${book.publication_year}`,
+      book.edition_number && `الطبعة: ${book.edition_number}`,
+      book.volume_number && `المجلد: ${book.volume_number}`,
+    ].filter(Boolean);
+    return `<tr data-book-id="${book.id}">
+      <td><div class="book-name"><span class="cover">${esc((book.title || book.file || "ك").slice(0, 1))}</span><div><strong>${esc(book.title || "بلا عنوان")}</strong><small>${esc(book.file)}</small></div></div></td>
+      <td class="${book.author ? "" : "missing"}">${esc(book.author || "لم يُعثر عليه")}</td>
+      <td class="${book.editor ? "" : "missing"}">${esc(book.editor || "لم يُعثر عليه")}</td>
+      <td class="${book.publisher ? "" : "missing"}">${esc(book.publisher || "لم يُعثر عليه")}</td>
+      <td class="${publication.length ? "publication-meta" : "missing"}">${publication.length ? publication.map((value) => `<small>${esc(value)}</small>`).join("") : "لم يُعثر عليها"}</td>
+      <td class="${book.topic ? "" : "missing"}">${esc(book.topic || "لم يُعثر عليه")}</td>
+      <td><span class="status ${statusClass(book.status)}">${statusLabel(book.status)}</span></td>
+      <td><button class="row-menu" data-row-menu="${book.id}" aria-label="تعديل ${esc(book.title)}">⋯</button></td>
+    </tr>`;
+  }
+
+  function renderBooks() {
+    const keepSearch = document.activeElement?.id === "bookSearch";
+    const cursor = keepSearch ? document.activeElement.selectionStart : 0;
+    const all = filteredBooks();
+    const pages = Math.max(1, Math.ceil(all.length / state.pageSize));
+    if (state.page > pages) state.page = pages;
+    const rows = all.slice((state.page - 1) * state.pageSize, state.page * state.pageSize);
+    $("#routeHost").innerHTML = `
+      <div class="page-head"><div><h1>الكتب</h1><p>${state.books.length} كتابًا في المكتبة المحلية</p></div><div class="actions"><button class="btn" data-action="add-file">إضافة ملف PDF</button><button class="btn" data-action="manual">إضافة كتاب يدويًا</button><button class="btn btn-primary" data-action="folder">فحص مجلد</button></div></div>
+      <div class="library-layout"><aside class="filters"><div class="filter-head"><strong>تصفية</strong><button class="link-btn" data-action="clear">مسح</button></div>
+        <div class="filter-group"><label>الحالة</label>${[["complete", "مكتمل"], ["review", "يحتاج مراجعة"], ["failed", "تعذر الفحص"]].map(([value, label]) => `<label class="check"><input type="checkbox" data-status="${value}" ${state.statuses.has(value) ? "checked" : ""}><span>${label}</span><em>${state.books.filter((book) => statusClass(book.status) === value).length}</em></label>`).join("")}</div>
+        <div class="filter-group"><label for="filterTopic">الموضوع</label><select class="select" id="filterTopic"><option value="all">كل الموضوعات</option>${listValues("topic").map((value) => `<option ${state.topic === value ? "selected" : ""}>${esc(value)}</option>`).join("")}</select></div>
+        <div class="filter-group"><label for="filterAuthor">المؤلف</label><select class="select" id="filterAuthor"><option value="all">كل المؤلفين</option>${listValues("author").map((value) => `<option ${state.author === value ? "selected" : ""}>${esc(value)}</option>`).join("")}</select></div>
+        <div class="filter-group"><label for="filterPublisher">دار النشر</label><select class="select" id="filterPublisher"><option value="all">كل دور النشر</option>${listValues("publisher").map((value) => `<option ${state.publisher === value ? "selected" : ""}>${esc(value)}</option>`).join("")}</select></div></aside>
+        <div class="books-panel"><div class="library-tools"><label class="search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="bookSearch" value="${esc(state.query)}" placeholder="ابحث في الكتب"></label><select class="sort" id="sortBooks"><option value="recent">آخر تحديث</option><option value="title" ${state.sort === "title" ? "selected" : ""}>العنوان</option><option value="author" ${state.sort === "author" ? "selected" : ""}>المؤلف</option></select></div>
+          <div class="table-card"><table><thead><tr><th>الكتاب</th><th>المؤلف</th><th>المحقق</th><th>دار النشر</th><th>بيانات النشر</th><th>الموضوع</th><th>الحالة</th><th></th></tr></thead><tbody>${rows.length ? rows.map(bookRow).join("") : `<tr><td class="empty" colspan="8">${state.books.length ? "لا توجد كتب مطابقة" : "المكتبة فارغة. أضف ملف PDF أو اختر مجلدًا للبدء."}</td></tr>`}</tbody></table></div>
+          <div class="pagination"><span>عرض ${all.length ? ((state.page - 1) * state.pageSize) + 1 : 0} إلى ${Math.min(state.page * state.pageSize, all.length)} من ${all.length}</span><div class="pages"><button class="page-btn" data-page="prev" ${state.page === 1 ? "disabled" : ""}>‹</button>${Array.from({ length: pages }, (_, index) => `<button class="page-btn ${state.page === index + 1 ? "active" : ""}" data-page="${index + 1}">${index + 1}</button>`).join("")}<button class="page-btn" data-page="next" ${state.page === pages ? "disabled" : ""}>›</button></div></div>
+        </div></div>`;
+    bindBooks();
+    if (keepSearch) {
+      const input = $("#bookSearch");
+      input.focus();
+      input.setSelectionRange(cursor, cursor);
+    }
+  }
+
+  function bindBooks() {
+    $("#bookSearch").oninput = (event) => { state.query = event.target.value; state.page = 1; renderBooks(); };
+    $("#sortBooks").onchange = (event) => { state.sort = event.target.value; renderBooks(); };
+    $("#filterTopic").onchange = (event) => { state.topic = event.target.value; state.page = 1; renderBooks(); };
+    $("#filterAuthor").onchange = (event) => { state.author = event.target.value; state.page = 1; renderBooks(); };
+    $("#filterPublisher").onchange = (event) => { state.publisher = event.target.value; state.page = 1; renderBooks(); };
+    $$("[data-status]").forEach((control) => control.onchange = () => {
+      control.checked ? state.statuses.add(control.dataset.status) : state.statuses.delete(control.dataset.status);
+      state.page = 1;
+      renderBooks();
+    });
+    $$("[data-book-id]").forEach((row) => row.onclick = () => go(`book/${row.dataset.bookId}`));
+    $$("[data-row-menu]").forEach((button) => button.onclick = (event) => {
+      event.stopPropagation();
+      openEdit(button.dataset.rowMenu);
+    });
+    $$("[data-page]").forEach((button) => button.onclick = () => {
+      if (button.dataset.page === "prev") state.page -= 1;
+      else if (button.dataset.page === "next") state.page += 1;
+      else state.page = Number(button.dataset.page);
+      renderBooks();
+    });
+    $$("[data-action]").forEach((button) => button.onclick = () => handleAction(button.dataset.action));
+  }
+
+  function scanActivityLabel(page, maxPages) {
+    const position = (page - 1) / Math.max(1, maxPages);
+    if (position < 0.2) return `أقرأ الصفحة ${page} وأتحقق من عنوان الكتاب`;
+    if (position < 0.4) return `أقرأ الصفحة ${page} وأتعرف على اسم المؤلف`;
+    if (position < 0.6) return `أقرأ الصفحة ${page} وأبحث عن المحقق`;
+    if (position < 0.8) return `أقرأ الصفحة ${page} وأستخرج بيانات النشر`;
+    return `أقرأ الصفحة ${page} وأراجع الطبعة والمجلد والموضوع`;
+  }
+
+  function renderScan() {
+    const scan = state.scan;
+    const running = scan && ["queued", "running"].includes(scan.state);
+    const item = running ? scan.items[scan.currentIndex] : null;
+    const finished = scan?.items?.filter((entry) => ["complete", "review", "failed", "skipped"].includes(entry.state)).length || 0;
+    const targetPages = item ? Math.min(scan.maxPages, state.books.find((book) => book.id === item.book_id)?.pageCount || scan.maxPages) : 1;
+    const bookPercent = item ? Math.min(100, Math.round(scan.currentPage / Math.max(targetPages, 1) * 100)) : 0;
+    const overallPercent = scan?.items?.length ? Math.min(100, Math.round((finished + (item ? bookPercent / 100 : 0)) / scan.items.length * 100)) : 0;
+    const heading = running ? (scan.paused ? "الفحص متوقف مؤقتًا" : "الكتاب الحالي")
+      : scan?.state === "cancelled" ? "أُوقف الفحص"
+        : scan?.state === "failed" ? "تعذر إكمال الفحص"
+          : scan?.items?.length ? "اكتمل الفحص" : "لا يوجد فحص جارٍ";
+    $("#routeHost").innerHTML = `
+      <div class="page-head"><div><h1>الفحص</h1><p>${esc(state.libraryLabel)}</p></div><div class="actions"><button class="btn" data-action="add-file">إضافة ملف PDF</button><button class="btn btn-primary" data-action="folder">فحص مجلد</button></div></div>
+      <div class="scan-grid"><section class="card"><div class="card-head"><h2>${heading}</h2><small>${finished} مكتمل من ${scan?.items?.length || 0}</small></div><div class="current-scan">${item ? `
+        <div class="scan-file"><div class="pdf-icon">PDF</div><div><strong>${esc(item.file)}</strong><small>الكتاب ${scan.currentIndex + 1} من ${scan.items.length}، الصفحة ${scan.currentPage || 1}، والحد الأقصى ${scan.maxPages}</small></div></div>
+        <div class="scan-activity ${scan.paused ? "paused" : ""}" role="status" aria-live="polite"><span class="activity-dot" aria-hidden="true"></span><div><small>ما يجري الآن</small><strong>${scan.paused ? `توقفت عند الصفحة ${scan.currentPage}` : scanActivityLabel(scan.currentPage || 1, targetPages)}</strong><p>${scan.paused ? "لن ينتقل الفحص إلى صفحة أخرى حتى تضغط على استكمال." : "أحلل النص الظاهر وأحدّث الحقول أدناه عند العثور على بيانات."}</p></div></div>
+        <div class="scan-progresses"><div class="progress-block"><div class="progress-meta"><span>تقدم الكتاب الحالي</span><strong>${bookPercent}%</strong></div><div class="progress"><span style="width:${bookPercent}%"></span></div></div><div class="progress-block"><div class="progress-meta"><span>تقدم الطابور كله</span><strong>${overallPercent}%</strong></div><div class="progress"><span style="width:${overallPercent}%"></span></div></div></div>
+        <div class="extracted">${fields.map(([key, label]) => `<div class="${item[key] ? "" : "active"}"><span>${label}</span><strong class="${item[key] ? "" : "waiting"}">${esc(item[key] || (scan.paused ? "متوقف مؤقتًا" : "جارٍ البحث"))}</strong></div>`).join("")}</div>
+        <div class="scan-controls"><button class="btn btn-primary" id="pauseScan">${scan.paused ? "استكمال الفحص" : "إيقاف مؤقت"}</button><button class="btn" id="skipScan">تخطي هذا الكتاب</button><button class="btn btn-danger" id="cancelScan">إنهاء الفحص</button></div>` : `
+        <div class="empty scan-empty"><strong>${heading}</strong><span>${scan?.error ? esc(scan.error) : "اختر ملف PDF أو مجلدًا لبدء استخراج بيانات الكتب."}</span><button class="btn btn-primary" data-action="folder">اختيار مجلد</button></div>`}</div></section>
+        <aside class="card"><div class="card-head"><h2>طابور الفحص</h2><small>${scan?.items?.length || 0} كتب</small></div><div class="queue-list">${scan?.items?.length ? scan.items.map((entry, index) => { const current = running && index === scan.currentIndex; return `<div class="queue-row ${current ? "current" : ""}"><span class="queue-num">${index + 1}</span><div><strong>${esc(entry.file)}</strong><small>${current && scan.paused ? "متوقف مؤقتًا" : statusLabel(current ? "current" : entry.state)}</small>${entry.error ? `<small class="missing">${esc(entry.error)}</small>` : ""}</div><span class="queue-state ${statusClass(current ? "current" : entry.state)}"></span></div>`; }).join("") : "<div class=\"empty\">الطابور فارغ</div>"}</div></aside></div>`;
+    $$("[data-action]").forEach((button) => button.onclick = () => handleAction(button.dataset.action));
+    if (item) {
+      $("#pauseScan").onclick = () => controlScan(scan.paused ? "resume" : "pause");
+      $("#skipScan").onclick = () => controlScan("skip");
+      $("#cancelScan").onclick = async () => {
+        if (confirm("سيُوقف الفحص الحالي وتبقى الكتب المكتملة محفوظة. هل تريد المتابعة؟")) await controlScan("cancel");
+      };
+    }
+  }
+
+  async function controlScan(action) {
+    try {
+      await api(`/api/scans/${state.scan.id}/${action}`, { method: "POST" });
+      await refreshData();
+    } catch (error) {
+      toast("تعذر تنفيذ الإجراء", error.message, "error");
+    }
+  }
+
+  function detailMetadataValue(book, key, label) {
+    const value = book[key];
+    if (!value) return '<strong class="missing">لم يُعثر عليه</strong>';
+    const route = detailEntityRoutes[key];
+    return route ? `<a class="metadata-link" href="#/${route}/${encodeURIComponent(value)}" aria-label="فتح صفحة ${esc(label)}: ${esc(value)}">${esc(value)}</a>` : `<strong>${esc(value)}</strong>`;
+  }
+
+  function renderDetail() {
+    const book = currentBook();
+    if (!book) { go("books"); return; }
+    const history = book.history || [];
+    $("#routeHost").innerHTML = `
+      <div class="detail-head"><button class="btn btn-icon back" id="backBooks">←</button><div><h1>${esc(book.title)}</h1><p>${esc(book.file)}</p></div><span class="status ${statusClass(book.status)}">${statusLabel(book.status)}</span><div class="actions"><button class="btn" id="openPdf" ${book.pageCount ? "" : "disabled"}>فتح ملف PDF</button><button class="btn" id="editBook">تعديل البيانات</button><button class="btn btn-primary" id="rescanBook" ${book.pageCount ? "" : "disabled"}>إعادة توليد البيانات</button></div></div>
+      <div class="detail-layout"><div><section class="card metadata"><div class="metadata-grid">${fields.map(([key, label]) => `<div class="meta-row"><span>${label}</span>${detailMetadataValue(book, key, label)}</div>`).join("")}<div class="meta-row"><span>الثقة</span><strong>${book.confidence}%</strong></div><div class="meta-row"><span>الصفحات المفحوصة</span><strong>${book.pagesChecked} من ${book.maxPages}</strong></div></div><div class="path-box">${esc(book.path)}</div>${book.error ? `<div class="impact missing">${esc(book.error)}</div>` : ""}</section><section class="card history"><div class="card-head"><h2>سجل الكتاب</h2></div><div style="padding:0 14px">${history.length ? history.map((entry) => `<div class="history-row"><time>${esc(formatDate(entry.date))}</time><span>${esc(entry.text)}</span><small>المحاولة ${entry.attempt || book.attempts}</small></div>`).join("") : '<div class="empty">لا توجد أحداث مسجلة</div>'}</div></section></div><aside class="card pdf-preview"><div class="pdf-page"><span>صفحة العنوان</span><strong>${esc(book.title)}</strong><span>${esc(book.author || "المؤلف غير معروف")}</span></div></aside></div>`;
+    $("#backBooks").onclick = () => go("books");
+    $("#openPdf").onclick = () => window.open(`/api/books/${book.id}/pdf`, "_blank", "noopener");
+    $("#editBook").onclick = () => openEdit(book.id);
+    $("#rescanBook").onclick = () => openRescan(book.id);
+  }
+
+  function entityConfig() { return entityTypes[state.entityType]; }
+  function entityRows() {
+    const config = entityConfig();
+    const map = new Map();
+    state.books.forEach((book) => {
+      const name = book[config.key];
+      if (!name) return;
+      if (!map.has(name)) map.set(name, []);
+      map.get(name).push(book);
+    });
+    return [...map.entries()].map(([name, books]) => ({ name, books }))
+      .filter((row) => !state.entityQuery || row.name.toLowerCase().includes(state.entityQuery.toLowerCase()))
+      .sort((a, b) => a.name.localeCompare(b.name, "ar"));
+  }
+
+  function renderEntities() {
+    const keepSearch = document.activeElement?.id === "entitySearch";
+    const cursor = keepSearch ? document.activeElement.selectionStart : 0;
+    const config = entityConfig();
+    const allRows = entityRows();
+    const pages = Math.max(1, Math.ceil(allRows.length / state.entityPageSize));
+    if (state.entityPage > pages) state.entityPage = pages;
+    const rows = allRows.slice((state.entityPage - 1) * state.entityPageSize, state.entityPage * state.entityPageSize);
+    const allSelected = rows.length && rows.every((row) => state.selectedEntities.has(row.name));
+    $("#routeHost").innerHTML = `
+      <div class="page-head"><div><h1>${config.title}</h1><p>${allRows.length} اسمًا مرتبة أبجديًا</p></div></div>
+      <div class="bulkbar"><label class="select-all"><input id="selectAllEntities" type="checkbox" ${allSelected ? "checked" : ""} aria-label="تحديد الصفحة"></label><label class="search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="entitySearch" value="${esc(state.entityQuery)}" placeholder="ابحث في ${config.title}"></label><select class="select" id="entityAction"><option value="">اختر إجراء</option><option value="merge" ${state.entityAction === "merge" ? "selected" : ""}>دمج المحدد</option><option value="rename" ${state.entityAction === "rename" ? "selected" : ""}>إعادة تسمية</option><option value="delete" ${state.entityAction === "delete" ? "selected" : ""}>حذف</option></select><button class="btn btn-primary" id="applyEntityAction" ${state.selectedEntities.size ? "" : "disabled"}>تنفيذ</button><span class="selected-count">${state.selectedEntities.size ? `${state.selectedEntities.size} محدد` : "لم تحدد شيئًا"}</span></div>
+      <div class="table-card"><table><thead><tr><th style="width:38px"></th><th>${config.singular}</th><th>عدد الكتب</th><th>كتب مرتبطة</th><th></th></tr></thead><tbody>${rows.length ? rows.map((row) => { const encoded = encodeURIComponent(row.name); return `<tr><td><input class="entity-check" type="checkbox" data-entity="${encoded}" ${state.selectedEntities.has(row.name) ? "checked" : ""}></td><td><button class="link-btn entity-name" data-view-entity="${encoded}">${esc(row.name)}</button></td><td>${row.books.length}</td><td class="book-examples">${esc(row.books.slice(0, 3).map((book) => book.title).join("، "))}${row.books.length > 3 ? "…" : ""}</td><td><button class="link-btn" data-view-entity="${encoded}">فتح الصفحة</button></td></tr>`; }).join("") : '<tr><td class="empty" colspan="5">لا توجد نتائج مطابقة</td></tr>'}</tbody></table></div>
+      <div class="pagination"><span>عرض ${allRows.length ? ((state.entityPage - 1) * state.entityPageSize) + 1 : 0} إلى ${Math.min(state.entityPage * state.entityPageSize, allRows.length)} من ${allRows.length}</span><div class="pages"><button class="page-btn" data-entity-page="prev" ${state.entityPage === 1 ? "disabled" : ""}>‹</button>${Array.from({ length: pages }, (_, index) => `<button class="page-btn ${state.entityPage === index + 1 ? "active" : ""}" data-entity-page="${index + 1}">${index + 1}</button>`).join("")}<button class="page-btn" data-entity-page="next" ${state.entityPage === pages ? "disabled" : ""}>›</button></div></div>`;
+    bindEntities(rows);
+    if (keepSearch) {
+      const input = $("#entitySearch");
+      input.focus();
+      input.setSelectionRange(cursor, cursor);
+    }
+  }
+
+  function bindEntities(pageRows) {
+    $("#entitySearch").oninput = (event) => { state.entityQuery = event.target.value; state.entityPage = 1; state.selectedEntities.clear(); renderEntities(); };
+    $("#entityAction").onchange = (event) => { state.entityAction = event.target.value; };
+    $("#selectAllEntities").onchange = (event) => {
+      const names = pageRows.map((row) => row.name);
+      event.target.checked ? names.forEach((name) => state.selectedEntities.add(name)) : names.forEach((name) => state.selectedEntities.delete(name));
+      renderEntities();
+    };
+    $$("[data-entity]").forEach((box) => box.onchange = () => {
+      const name = decodeURIComponent(box.dataset.entity);
+      box.checked ? state.selectedEntities.add(name) : state.selectedEntities.delete(name);
+      renderEntities();
+    });
+    $$("[data-view-entity]").forEach((button) => button.onclick = () => go(`${state.entityType}/${button.dataset.viewEntity}`));
+    $$("[data-entity-page]").forEach((button) => button.onclick = () => {
+      if (button.dataset.entityPage === "prev") state.entityPage -= 1;
+      else if (button.dataset.entityPage === "next") state.entityPage += 1;
+      else state.entityPage = Number(button.dataset.entityPage);
+      renderEntities();
+    });
+    $("#applyEntityAction").onclick = applyEntityAction;
+  }
+
+  function renderEntityDetail() {
+    const config = entityConfig();
+    const name = decodeURIComponent(state.route.split("/").slice(1).join("/"));
+    const books = state.books.filter((book) => book[config.key] === name);
+    if (!books.length) { go(state.entityType); return; }
+    $("#routeHost").innerHTML = `
+      <div class="detail-head"><button class="btn btn-icon back" id="backEntities">←</button><div><h1>${esc(name)}</h1><p>${books.length} كتاب</p></div><div class="actions"><button class="btn" id="renameEntity">إعادة تسمية</button><button class="btn btn-danger" id="deleteEntity">حذف</button></div></div>
+      <div class="table-card"><table><thead><tr><th>الكتاب</th><th>المؤلف</th><th>المحقق</th><th>دار النشر</th><th>بيانات النشر</th><th>الموضوع</th><th>الحالة</th><th></th></tr></thead><tbody>${books.map(bookRow).join("")}</tbody></table></div>`;
+    $("#backEntities").onclick = () => go(state.entityType);
+    $$("[data-book-id]").forEach((row) => row.onclick = () => go(`book/${row.dataset.bookId}`));
+    $("#renameEntity").onclick = () => { state.selectedEntities = new Set([name]); openEntityMerge("rename"); };
+    $("#deleteEntity").onclick = () => { state.selectedEntities = new Set([name]); deleteEntities(); };
+  }
+
+  function renderSettings() {
+    const modelOptions = geminiModels.map((model) => {
+      const selected = model.value === state.settings.model ? " selected" : "";
+      return `<option value="${model.value}"${selected}>${model.label} (${model.dailyRequests} طلب يوميًا)</option>`;
+    }).join("");
+    $("#routeHost").innerHTML = `
+      <div class="page-head"><div><h1>الإعدادات</h1><p>مفتاح Gemini والنموذج والتعليمات المستخدمة في فحص الكتب</p></div><div class="actions"><button class="btn btn-primary" id="saveSettings">حفظ الإعدادات</button></div></div>
+      <div class="settings-layout"><section class="card settings-card"><h2>Gemini API</h2><p>يحفظ التطبيق المفتاح داخل قاعدة SQLite المحلية على هذا الكمبيوتر.</p><div class="form-field"><label for="apiKeyInput">API Key</label><div class="secret-field"><input class="input" id="apiKeyInput" type="password" autocomplete="new-password" placeholder="${state.settings.keySaved ? "المفتاح محفوظ. اتركه فارغًا للاحتفاظ به" : "أدخل المفتاح"}"><button class="btn btn-icon" id="toggleApiKey" type="button" aria-label="إظهار المفتاح"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div><div class="form-field" style="margin-top:14px"><label for="modelInput">نموذج Gemini</label><select class="input" id="modelInput" dir="ltr" aria-describedby="modelInputHint">${modelOptions}</select><div class="hint" id="modelInputHint">العدد بين القوسين هو الحد المجاني للطلبات يوميًا.</div></div><div class="key-status ${state.settings.keySaved ? "saved" : ""}">${state.settings.keySaved ? "المفتاح محفوظ في قاعدة البيانات" : "لم يُحفظ مفتاح بعد"}</div></section>
+      <section class="card prompt-card"><div class="prompt-head"><h2>Prompt استخراج بيانات الكتاب</h2><button class="btn btn-small" id="resetPrompt">استعادة النص الافتراضي</button></div><div class="prompt-body"><div class="variables"><span>إدراج متغير</span>${["{{file_name}}", "{{page_number}}", "{{max_pages}}", "{{previous_results}}"].map((token) => `<button class="variable-btn" data-token="${token}">${token}</button>`).join("")}</div><textarea class="prompt-editor" id="promptInput" spellcheck="false">${esc(state.settings.prompt)}</textarea><div class="prompt-foot"><span>تُستبدل المتغيرات قبل الطلب. مخطط JSON ثابت داخل الخادم ولا يظهر هنا.</span><span id="promptCount">${state.settings.prompt.length} حرف</span></div></div></section></div>`;
+    bindSettings();
+  }
+
+  function bindSettings() {
+    const key = $("#apiKeyInput");
+    const prompt = $("#promptInput");
+    $("#toggleApiKey").onclick = () => {
+      key.type = key.type === "password" ? "text" : "password";
+      $("#toggleApiKey").setAttribute("aria-label", key.type === "password" ? "إظهار المفتاح" : "إخفاء المفتاح");
+    };
+    prompt.oninput = () => { $("#promptCount").textContent = `${prompt.value.length} حرف`; };
+    $$("[data-token]").forEach((button) => button.onclick = () => {
+      prompt.focus();
+      prompt.setRangeText(button.dataset.token, prompt.selectionStart, prompt.selectionEnd, "end");
+      prompt.dispatchEvent(new Event("input"));
+    });
+    $("#resetPrompt").onclick = () => {
+      prompt.value = state.settings.defaultPrompt;
+      prompt.dispatchEvent(new Event("input"));
+      prompt.focus();
+    };
+    $("#saveSettings").onclick = async () => {
+      const payload = { api_key: key.value.trim(), prompt: prompt.value.trim(), model: $("#modelInput").value.trim() };
+      if (!payload.api_key && !state.settings.keySaved) return toast("مفتاح API مطلوب", "أدخل مفتاح Gemini قبل الحفظ", "error");
+      if (!payload.prompt) return toast("الـPrompt مطلوب", "أدخل تعليمات استخراج البيانات", "error");
+      try {
+        await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        await refreshData();
+        toast("حُفظت الإعدادات", "ستُستخدم في عمليات الفحص القادمة");
+      } catch (error) {
+        toast("تعذر حفظ الإعدادات", error.message, "error");
+      }
+    };
+  }
+
+  function applyEntityAction() {
+    const count = state.selectedEntities.size;
+    const action = state.entityAction;
+    if (!action) return toast("اختر إجراءً", "حدد الدمج أو إعادة التسمية أو الحذف", "error");
+    if (action === "merge" && count < 2) return toast("اختر اسمين على الأقل", "الدمج يحتاج إلى اسمين أو أكثر", "error");
+    if (action === "rename" && count !== 1) return toast("اختر اسمًا واحدًا", "إعادة التسمية تعمل على اسم واحد", "error");
+    if (action === "delete") return deleteEntities();
+    openEntityMerge(action);
+  }
+
+  function openEntityMerge(mode) {
+    state.entityMode = mode;
+    const config = entityConfig();
+    const selected = [...state.selectedEntities];
+    const counts = new Map(entityRows().map((row) => [row.name, row.books.length]));
+    const suggested = [...selected].sort((a, b) => (counts.get(b) || 0) - (counts.get(a) || 0))[0] || "";
+    $("#entityMergeTitle").textContent = mode === "merge" ? `دمج ${config.title}` : `إعادة تسمية ${config.singular}`;
+    $("#entityMergeList").innerHTML = selected.map((name) => `<span class="merge-chip">${esc(name)} · ${counts.get(name) || 0} كتاب</span>`).join("");
+    $("#canonicalEntityName").value = suggested;
+    const affected = state.books.filter((book) => selected.includes(book[config.key])).length;
+    $("#mergeImpact").textContent = mode === "merge" ? `ستصبح الكتب البالغ عددها ${affected} تحت اسم واحد.` : `سيظهر الاسم الجديد في ${affected} كتاب.`;
+    openModal("entityMergeModal");
+  }
+
+  async function saveEntityMerge() {
+    const canonical = $("#canonicalEntityName").value.trim();
+    if (!canonical) return toast("الاسم مطلوب", "اكتب الاسم الصحيح قبل الحفظ", "error");
+    const wasDetail = state.route.includes("/");
+    try {
+      const result = await api(`/api/entities/${entityConfig().key}/change`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ names: [...state.selectedEntities], canonical }),
+      });
+      state.selectedEntities.clear();
+      state.entityAction = "";
+      closeModal("entityMergeModal");
+      await refreshData(false);
+      wasDetail ? go(state.entityType) : render();
+      toast("حُفظ التغيير", `${result.affected} كتاب تحت اسم ${canonical}`);
+    } catch (error) {
+      toast("تعذر حفظ التغيير", error.message, "error");
+    }
+  }
+
+  async function deleteEntities() {
+    const config = entityConfig();
+    const names = [...state.selectedEntities];
+    const affected = state.books.filter((book) => names.includes(book[config.key])).length;
+    const wasDetail = state.route.includes("/");
+    if (!confirm(`سيُحذف ${config.singular} من ${affected} كتاب. هل تريد المتابعة؟`)) return;
+    try {
+      await api(`/api/entities/${config.key}/change`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ names, canonical: null }),
+      });
+      state.selectedEntities.clear();
+      state.entityAction = "";
+      await refreshData(false);
+      wasDetail ? go(state.entityType) : render();
+      toast("تم الحذف", `${affected} كتاب يحتاج مراجعة`);
+    } catch (error) {
+      toast("تعذر الحذف", error.message, "error");
+    }
+  }
+
+  function handleAction(action) {
+    if (action === "folder") openFolder();
+    if (action === "add-file") $("#singleFileInput").click();
+    if (action === "manual") openManual();
+    if (action === "clear") {
+      state.query = "";
+      state.statuses.clear();
+      state.topic = state.author = state.publisher = "all";
+      state.page = 1;
+      renderBooks();
+    }
+  }
+
+  function openModal(id) { $(`#${id}`).classList.add("open"); }
+  function closeModal(id) { $(`#${id}`).classList.remove("open"); }
+  function openFolder() {
+    pendingFolder = "";
+    pendingFiles = [];
+    $("#pendingFolderPath").textContent = "لم يُحدد مجلد";
+    $("#startFolderScanBtn").disabled = true;
+    openModal("folderModal");
+  }
+  function chooseFolder(path, files) {
+    pendingFolder = path;
+    pendingFiles = files;
+    $("#pendingFolderPath").textContent = path;
+    $("#startFolderScanBtn").disabled = !files.length;
+  }
+  function readMaxPages(id) {
+    const input = $(`#${id}`);
+    const value = Number(input.value);
+    if (!Number.isInteger(value) || value < 1 || value > 100) {
+      input.setAttribute("aria-invalid", "true");
+      input.focus();
+      toast("عدد الصفحات غير صحيح", "اكتب رقمًا صحيحًا من 1 إلى 100", "error");
+      return null;
+    }
+    input.removeAttribute("aria-invalid");
+    return value;
+  }
+
+  async function uploadAndScan(files, maxPages, folderLabel) {
+    if (!state.settings.keySaved) {
+      toast("أدخل مفتاح Gemini أولًا", "احفظ المفتاح من صفحة الإعدادات ثم أعد اختيار الملفات", "error");
+      go("settings");
+      return;
+    }
+    if (state.scan && ["queued", "running"].includes(state.scan.state)) {
+      toast("يوجد فحص جارٍ", "انتظر اكتماله أو أوقفه قبل إضافة طابور جديد", "error");
+      go("scan");
+      return;
+    }
+    state.uploading = true;
+    go("scan");
+    $("#routeHost").innerHTML = `<div class="card"><div class="empty scan-empty"><strong>أرفع ملفات PDF</strong><span id="uploadProgress">0 من ${files.length}</span></div></div>`;
+    try {
+      const bookIds = [];
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
+        const relative = file.webkitRelativePath || file.name;
+        const book = await api("/api/uploads", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/pdf",
+            "X-File-Name": encodeURIComponent(file.name),
+            "X-Relative-Path": encodeURIComponent(relative),
+          },
+          body: file,
+        });
+        bookIds.push(book.id);
+        const progress = $("#uploadProgress");
+        if (progress) progress.textContent = `${index + 1} من ${files.length}: ${file.name}`;
+      }
+      state.libraryLabel = folderLabel || "المكتبة المحلية";
+      await api("/api/scans", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ book_ids: bookIds, max_pages: maxPages }),
+      });
+      await refreshData();
+      toast("بدأ الفحص", `${files.length} كتاب في الطابور`);
+    } catch (error) {
+      await refreshData();
+      toast("تعذر بدء الفحص", error.message, "error");
+    } finally {
+      state.uploading = false;
+    }
+  }
+
+  function openManual() {
+    $("#manualFields").innerHTML = formFields({
+      title: "", author: "", editor: "", publisher: "", publication_year: "",
+      edition_number: "", volume_number: "", topic: "", path: "",
+    }, true);
+    openModal("manualModal");
+  }
+  function formFields(book, includePath = false) {
+    return fields.map(([key, label]) => `<div class="form-field"><label>${label}</label><input class="input" data-field="${key}" value="${esc(book[key] || "")}"></div>`).join("")
+      + (includePath ? `<div class="form-field full"><label>مسار مرجعي لملف PDF</label><input class="input" data-field="path" value="${esc(book.path || "")}" placeholder="اختياري"></div>` : "");
+  }
+  function openEdit(id) {
+    const book = state.books.find((entry) => entry.id === id);
+    if (!book) return;
+    state.editingId = id;
+    $("#editFields").innerHTML = formFields(book);
+    openModal("editModal");
+  }
+  function openRescan(id) {
+    const book = state.books.find((entry) => entry.id === id);
+    if (!book) return;
+    state.rescanId = id;
+    $("#rescanMaxPages").value = book.maxPages || 5;
+    openModal("rescanModal");
+  }
+  function collect(container) {
+    const data = {};
+    container.querySelectorAll("[data-field]").forEach((input) => { data[input.dataset.field] = input.value.trim(); });
+    return data;
+  }
+  function toast(title, message, kind = "") {
+    $(".toast")?.remove();
+    const node = document.createElement("div");
+    node.className = `toast ${kind}`;
+    node.innerHTML = `<strong>${esc(title)}</strong><span>${esc(message)}</span>`;
+    $("#toastHost").appendChild(node);
+    setTimeout(() => node.remove(), 5000);
+  }
+
+  function bindStaticControls() {
+    $$("[data-route]").forEach((button) => button.onclick = () => go(button.dataset.route));
+    $("#scanIndicator").onclick = () => go("scan");
+    $("#sidebarFolder").onclick = openFolder;
+    $("#pickFolderBtn").onclick = () => $("#folderInput").click();
+    $("#recentFolderBtn").hidden = true;
+    $("#folderInput").onchange = (event) => {
+      const files = [...event.target.files].filter((file) => file.name.toLowerCase().endsWith(".pdf"));
+      if (!files.length) return toast("لا توجد ملفات PDF", "اختر مجلدًا آخر", "error");
+      const path = files[0].webkitRelativePath.split("/")[0] || "المجلد المختار";
+      chooseFolder(path, files);
+    };
+    $("#startFolderScanBtn").onclick = () => {
+      const maxPages = readMaxPages("folderMaxPages");
+      if (maxPages === null) return;
+      closeModal("folderModal");
+      uploadAndScan(pendingFiles, maxPages, pendingFolder);
+      $("#folderInput").value = "";
+    };
+    $("#singleFileInput").onchange = (event) => {
+      const file = event.target.files[0];
+      if (!file) return;
+      uploadAndScan([file], 5, file.name);
+      event.target.value = "";
+    };
+    $("#saveManualBtn").onclick = async () => {
+      const data = collect($("#manualFields"));
+      if (!data.title) return toast("العنوان مطلوب", "اكتب عنوان الكتاب", "error");
+      try {
+        await api("/api/books/manual", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+        closeModal("manualModal");
+        await refreshData(false);
+        state.page = 1;
+        go("books");
+        render();
+        toast("أُضيف الكتاب", data.title);
+      } catch (error) {
+        toast("تعذر إضافة الكتاب", error.message, "error");
+      }
+    };
+    $("#saveEditBtn").onclick = async () => {
+      const data = collect($("#editFields"));
+      if (!data.title) return toast("العنوان مطلوب", "اكتب عنوان الكتاب", "error");
+      try {
+        await api(`/api/books/${state.editingId}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...data, path: "" }) });
+        closeModal("editModal");
+        await refreshData();
+        toast("حُفظت البيانات", data.title);
+      } catch (error) {
+        toast("تعذر حفظ البيانات", error.message, "error");
+      }
+    };
+    $("#confirmRescanBtn").onclick = async () => {
+      const maxPages = readMaxPages("rescanMaxPages");
+      if (maxPages === null) return;
+      closeModal("rescanModal");
+      try {
+        await api("/api/scans", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ book_ids: [state.rescanId], max_pages: maxPages }) });
+        go("scan");
+        await refreshData();
+      } catch (error) {
+        toast("تعذر بدء إعادة الفحص", error.message, "error");
+      }
+    };
+    $("#saveEntityMergeBtn").onclick = saveEntityMerge;
+    $$("[data-close]").forEach((button) => button.onclick = () => closeModal(button.dataset.close));
+    $$(".modal-backdrop").forEach((modal) => modal.onclick = (event) => { if (event.target === modal) closeModal(modal.id); });
+    window.addEventListener("hashchange", parseRoute);
+  }
+
+  async function initialize() {
+    bindStaticControls();
+    $("#routeHost").innerHTML = '<div class="card"><div class="empty">جارٍ فتح المكتبة…</div></div>';
+    try {
+      await refreshData(false);
+      if (!location.hash) location.hash = "#/books";
+      else parseRoute();
+    } catch (error) {
+      $("#routeHost").innerHTML = `<div class="card"><div class="empty missing">تعذر فتح المكتبة: ${esc(error.message)}</div></div>`;
+    }
+  }
+
+  initialize();
+})();
