@@ -164,11 +164,11 @@ class ScanManager:
         client: GeminiCataloguer,
     ) -> str:
         book = self.library.get_book(book_id)
-        path: Path = self.library.source_path(book_id)
-        page_limit = min(max_pages, book["pageCount"])
         values = {field: book.get(field, "") for field in CATALOG_FIELDS}
         scores = {field: 0 for field in CATALOG_FIELDS}
         try:
+            path: Path = self.library.source_path(book_id)
+            page_limit = min(max_pages, book["pageCount"])
             images: list[bytes] = []
             image_budget = MAX_INLINE_IMAGE_BYTES // page_limit
             for page_number in range(1, page_limit + 1):
@@ -228,6 +228,8 @@ class ScanManager:
             final_book = self.library.get_book(book_id)
             return final_book["status"]
         except Exception as exc:
+            file_label = book.get("file") or book.get("title") or book_id
+            message = f'تعذر فحص "{file_label}": {exc}'
             confidence = overall_confidence(values, scores)
             self.library.update_scan_result(
                 book_id,
@@ -236,7 +238,7 @@ class ScanManager:
                 max_pages=max_pages,
                 confidence=confidence,
                 final=True,
-                error=str(exc),
+                error=message,
             )
             return "failed"
 

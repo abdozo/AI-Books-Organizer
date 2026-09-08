@@ -150,3 +150,23 @@ def test_scan_uses_the_actual_pdf_page_count_when_it_is_below_the_user_limit(mon
 
     assert calls == [[1, 2]]
     assert library.api_reservations == 1
+
+
+def test_scan_error_identifies_the_book_file(monkeypatch):
+    library = FakeLibrary()
+    manager = ScanManager(library, SimpleNamespace())
+    saved_results = []
+    library.update_scan_result = lambda _book_id, **values: saved_results.append(values)
+
+    def fail_render(*_args, **_kwargs):
+        raise RuntimeError("الصفحة تالفة")
+
+    monkeypatch.setattr("organizer.scanner.render_page", fail_render)
+
+    outcome = manager._scan_book(
+        "scan-1", "book-1", max_pages=5, prompt_template="{{previous_results}}",
+        model="gemini-3.8-flash", client=SimpleNamespace(),
+    )
+
+    assert outcome == "failed"
+    assert saved_results[0]["error"] == 'تعذر فحص "book.pdf": الصفحة تالفة'

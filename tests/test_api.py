@@ -276,6 +276,39 @@ def test_folder_import_discovers_and_references_original_pdfs(tmp_path, monkeypa
     assert list((data_root / "books").rglob("*.pdf")) == []
 
 
+def test_folder_import_error_identifies_the_pdf_and_reported_page_count(tmp_path, monkeypatch):
+    root = tmp_path / "library"
+    root.mkdir()
+    first = root / "كتاب سليم.pdf"
+    failing = root / "الكتاب المسبب للمشكلة.pdf"
+    first.write_bytes(b"%PDF-first")
+    failing.write_bytes(b"%PDF-failing")
+    client = TestClient(create_app(tmp_path / "data"))
+
+    def inspect(path):
+        if path == failing:
+            raise ValueError(
+                "أبلغ قارئ PDF عن 6,001 صفحة في بنية الملف، "
+                "بينما حد الأمان 5,000 صفحة"
+            )
+        return 12
+
+    monkeypatch.setattr("organizer.main.inspect_pdf", inspect)
+
+    response = client.post("/api/imports/folder", json={
+        "path": str(root),
+        "include_subfolders": False,
+        "max_depth": 1,
+        "per_folder_limit": 100,
+    })
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        'تعذر فحص "الكتاب المسبب للمشكلة.pdf": أبلغ قارئ PDF عن 6,001 صفحة '
+        'في بنية الملف، بينما حد الأمان 5,000 صفحة'
+    )
+
+
 def test_folder_import_stops_at_row_limit_then_resumes_with_unseen_files(tmp_path, monkeypatch):
     root = tmp_path / "library"
     root.mkdir()

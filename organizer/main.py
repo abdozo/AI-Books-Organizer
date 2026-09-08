@@ -109,10 +109,16 @@ def create_app(data_root: Path | None = None, secret_store: SecretStore | None =
         path = pick_local_folder()
         return {"path": str(path) if path else ""}
 
+    def inspect_book_pdf(path: Path) -> int:
+        try:
+            return inspect_pdf(path)
+        except (ValueError, RuntimeError) as exc:
+            raise ValueError(f'تعذر فحص "{path.name}": {exc}') from exc
+
     @app.post("/api/imports/file", status_code=201)
     def import_file(payload: LocalFileInput) -> dict[str, Any]:
         path = local_pdf(payload.path)
-        return library.create_referenced_book(path, inspect_pdf(path))
+        return library.create_referenced_book(path, inspect_book_pdf(path))
 
     def folder_paths(payload: LocalFolderInput) -> tuple[Path, list[Path], int, int]:
         return discover_pdfs(
@@ -135,7 +141,7 @@ def create_app(data_root: Path | None = None, secret_store: SecretStore | None =
     @app.post("/api/imports/folder", status_code=201)
     def import_folder(payload: LocalFolderInput) -> dict[str, Any]:
         root, paths, folder_count, skipped_count = folder_paths(payload)
-        entries = [(path, inspect_pdf(path)) for path in paths]
+        entries = [(path, inspect_book_pdf(path)) for path in paths]
         book_ids = library.create_referenced_books(
             entries, folder_root=root, skip_processed=True,
         )
@@ -170,7 +176,7 @@ def create_app(data_root: Path | None = None, secret_store: SecretStore | None =
     @app.put("/api/books/{book_id}/path")
     def update_book_path(book_id: str, payload: BookPathInput) -> dict[str, Any]:
         path = local_pdf(payload.path)
-        return library.update_book_path(book_id, path, inspect_pdf(path))
+        return library.update_book_path(book_id, path, inspect_book_pdf(path))
 
     @app.get("/api/books/{book_id}/pdf", include_in_schema=False)
     def open_pdf(book_id: str) -> FileResponse:
