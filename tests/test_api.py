@@ -276,7 +276,7 @@ def test_folder_import_discovers_and_references_original_pdfs(tmp_path, monkeypa
     assert list((data_root / "books").rglob("*.pdf")) == []
 
 
-def test_folder_import_error_identifies_the_pdf_and_reported_page_count(tmp_path, monkeypatch):
+def test_folder_import_error_identifies_the_pdf(tmp_path, monkeypatch):
     root = tmp_path / "library"
     root.mkdir()
     first = root / "كتاب سليم.pdf"
@@ -287,10 +287,7 @@ def test_folder_import_error_identifies_the_pdf_and_reported_page_count(tmp_path
 
     def inspect(path):
         if path == failing:
-            raise ValueError(
-                "أبلغ قارئ PDF عن 6,001 صفحة في بنية الملف، "
-                "بينما حد الأمان 5,000 صفحة"
-            )
+            raise ValueError("تعذر فتح ملف PDF: بنية الصفحات تالفة")
         return 12
 
     monkeypatch.setattr("organizer.main.inspect_pdf", inspect)
@@ -304,8 +301,8 @@ def test_folder_import_error_identifies_the_pdf_and_reported_page_count(tmp_path
 
     assert response.status_code == 400
     assert response.json()["detail"] == (
-        'تعذر فحص "الكتاب المسبب للمشكلة.pdf": أبلغ قارئ PDF عن 6,001 صفحة '
-        'في بنية الملف، بينما حد الأمان 5,000 صفحة'
+        'تعذر فحص "الكتاب المسبب للمشكلة.pdf": '
+        'تعذر فتح ملف PDF: بنية الصفحات تالفة'
     )
 
 

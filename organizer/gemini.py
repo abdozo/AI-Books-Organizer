@@ -33,11 +33,6 @@ def inspect_pdf(source: bytes | Path) -> int:
         raise ValueError(f"تعذر فتح ملف PDF: {exc}") from exc
     if count < 1:
         raise ValueError("ملف PDF خالٍ من الصفحات")
-    if count > 5000:
-        raise ValueError(
-            f"أبلغ قارئ PDF عن {count:,} صفحة في بنية الملف، "
-            "بينما حد الأمان 5,000 صفحة"
-        )
     return count
 
 

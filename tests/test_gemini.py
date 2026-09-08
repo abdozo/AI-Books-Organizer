@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from google import genai
 from PIL import Image
 import pypdfium2 as pdfium
-import pytest
 
 from organizer.gemini import GeminiCataloguer, _encode_jpeg_with_limit, inspect_pdf, render_prompt
 from organizer.models import BOOK_REPLY_SCHEMA, DEFAULT_PROMPT
@@ -38,7 +37,7 @@ def test_rendered_page_is_compressed_to_its_request_budget():
     assert len(encoded) <= 180_000
 
 
-def test_pdf_page_limit_error_reports_the_count_read_from_the_file(monkeypatch, tmp_path):
+def test_pdf_page_count_has_no_upper_limit(monkeypatch, tmp_path):
     class LargePdf:
         def __enter__(self):
             return self
@@ -51,13 +50,7 @@ def test_pdf_page_limit_error_reports_the_count_read_from_the_file(monkeypatch, 
 
     monkeypatch.setattr(pdfium, "PdfDocument", lambda _source: LargePdf())
 
-    with pytest.raises(ValueError) as error:
-        inspect_pdf(tmp_path / "large.pdf")
-
-    assert str(error.value) == (
-        "أبلغ قارئ PDF عن 6,001 صفحة في بنية الملف، "
-        "بينما حد الأمان 5,000 صفحة"
-    )
+    assert inspect_pdf(tmp_path / "large.pdf") == 6001
 
 
 def test_gemini_receives_the_fixed_schema_outside_the_prompt():
