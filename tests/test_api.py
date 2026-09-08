@@ -137,6 +137,35 @@ def test_selected_books_can_move_to_another_topic(tmp_path):
     assert {book["topic"] for book in books} == {"حديث"}
 
 
+def test_selected_books_can_be_deleted_without_removing_original_files(tmp_path):
+    pdf = tmp_path / "original.pdf"
+    pdf.write_bytes(b"%PDF-original")
+    app = create_app(tmp_path / "data")
+    client = TestClient(app)
+    deleted = client.post(
+        "/api/books/manual",
+        json={"title": "كتاب محذوف", "author": "مؤلف وحيد", "topic": "فقه", "path": str(pdf)},
+    ).json()
+    kept = client.post(
+        "/api/books/manual",
+        json={"title": "كتاب باقٍ", "author": "مؤلف آخر", "topic": "حديث"},
+    ).json()
+
+    response = client.request("DELETE", "/api/books", json={"book_ids": [deleted["id"]]})
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 1}
+    books = client.get("/api/bootstrap").json()["books"]
+    assert [book["id"] for book in books] == [kept["id"]]
+    assert {book["author"] for book in books} == {"مؤلف آخر"}
+    assert {book["topic"] for book in books} == {"حديث"}
+    assert pdf.is_file()
+    with app.state.library.connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM book_history WHERE book_id=?", (deleted["id"],)
+        ).fetchone()[0] == 0
+
+
 def test_book_folder_endpoint_reveals_the_real_path(tmp_path, monkeypatch):
     pdf = tmp_path / "original.pdf"
     pdf.write_bytes(b"not needed for a manual book")

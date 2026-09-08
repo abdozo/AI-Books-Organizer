@@ -281,6 +281,18 @@ class BookExportInput(BaseModel):
         return result
 
 
+class BookDeleteInput(BaseModel):
+    book_ids: list[str] = Field(min_length=1, max_length=500)
+
+    @field_validator("book_ids")
+    @classmethod
+    def unique_book_ids(cls, values: list[str]) -> list[str]:
+        result = list(dict.fromkeys(value.strip() for value in values if value.strip()))
+        if not result:
+            raise ValueError("اختر كتابًا واحدًا على الأقل")
+        return result
+
+
 class BookMoveInput(BaseModel):
     book_ids: list[str] = Field(min_length=1, max_length=500)
     topic: str = Field(min_length=1, max_length=500)

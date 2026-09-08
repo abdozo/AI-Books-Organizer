@@ -352,6 +352,34 @@ class Library:
                 self._history(db, row["id"], event, row["attempts"])
         return len(changed)
 
+    def delete_books(self, book_ids: list[str]) -> int:
+        unique_ids = list(dict.fromkeys(book_id.strip() for book_id in book_ids if book_id.strip()))
+        if not unique_ids:
+            raise ValueError("اختر كتابًا واحدًا على الأقل")
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.transaction() as db:
+            rows = db.execute(
+                f"SELECT id FROM books WHERE id IN ({placeholders})",
+                unique_ids,
+            ).fetchall()
+            if len(rows) != len(unique_ids):
+                raise KeyError("تعذر العثور على أحد الكتب")
+            active = db.execute(
+                f"""SELECT 1 FROM scan_items si
+                    JOIN scans s ON s.id=si.scan_id
+                    WHERE si.book_id IN ({placeholders})
+                      AND s.state IN ('queued','running')
+                    LIMIT 1""",
+                unique_ids,
+            ).fetchone()
+            if active:
+                raise ValueError("لا يمكن حذف كتاب موجود في فحص جارٍ. أوقف الفحص أولًا")
+            cursor = db.execute(
+                f"DELETE FROM books WHERE id IN ({placeholders})",
+                unique_ids,
+            )
+        return cursor.rowcount
+
     def change_entities(self, field: str, names: list[str], canonical: str | None) -> int:
         if field not in ENTITY_FIELDS:
             raise ValueError("حقل الفهرس غير صالح")

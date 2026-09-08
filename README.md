@@ -12,17 +12,17 @@
 
 1. ثبّت [Python](https://www.python.org/downloads/windows/) بإصدار 3.11 أو أحدث إذا لم يكن موجودًا. فعّل خيار `Add python.exe to PATH` أثناء التثبيت.
 2. انسخ مجلد التطبيق كاملًا إلى الجهاز، لكن لا تنسخ مجلد `.venv` من جهاز آخر.
-3. انقر نقرًا مزدوجًا على `Start-Books-Organizer.bat`.
+3. افتح مجلد `Windows`، ثم انقر نقرًا مزدوجًا على `Start-Books-Organizer.bat`.
 4. انتظر حتى ينتهي تنزيل الحزم في أول تشغيل. يفتح التطبيق في المتصفح تلقائيًا.
 
-ملفات التحكم على Windows:
+جميع ملفات التحكم الخاصة بـWindows موجودة داخل مجلد `Windows`:
 
-- `Start-Books-Organizer.bat` يشغل التطبيق.
-- `Stop-Books-Organizer.bat` يوقفه.
-- `Restart-Books-Organizer.bat` يعيد تشغيله.
-- `Update.bat` يوقف التطبيق، وينتقل إلى فرع `main`، ويسحب آخر نسخة من GitHub، ثم يشغله من جديد.
+- `Windows/Start-Books-Organizer.bat` يشغل التطبيق.
+- `Windows/Stop-Books-Organizer.bat` يوقفه.
+- `Windows/Restart-Books-Organizer.bat` يعيد تشغيله.
+- `Windows/Update.bat` يوقف التطبيق، وينتقل إلى فرع `main`، ويسحب آخر نسخة من GitHub، ثم يشغله من جديد.
 
-يحتاج `Update.bat` إلى تثبيت Git for Windows، ويجب أن يكون مجلد التطبيق نسخة Git مستنسخة من المستودع، وليس مجلدًا ناتجًا عن تنزيل ملف ZIP. انقر على الملف نقرًا مزدوجًا لبدء التحديث. لا يحذف الملف تعديلاتك المحلية، وإذا منع Git التحديث بسبب وجود تعديلات فسيعرض الخطأ ويتوقف حتى لا يشغّل نسخة غير مكتملة.
+يحتاج `Windows/Update.bat` إلى تثبيت Git for Windows، ويجب أن يكون مجلد التطبيق نسخة Git مستنسخة من المستودع، وليس مجلدًا ناتجًا عن تنزيل ملف ZIP. انقر على الملف نقرًا مزدوجًا لبدء التحديث. لا يحذف الملف تعديلاتك المحلية، وإذا منع Git التحديث بسبب وجود تعديلات فسيعرض الخطأ ويتوقف حتى لا يشغّل نسخة غير مكتملة.
 
 إذا عرض Windows تحذير SmartScreen، شغّل الملف فقط إذا حصلت على نسخة التطبيق من مصدر تثق به.
 
@@ -30,19 +30,19 @@
 
 1. افتح Terminal ونفّذ `python3 --version`. إذا كان الإصدار أقدم من 3.11 أو لم يعمل الأمر، ثبّت [Python](https://www.python.org/downloads/macos/) بإصدار 3.11 أو أحدث.
 2. انسخ مجلد التطبيق كاملًا إلى الجهاز، لكن لا تنسخ مجلد `.venv` من جهاز آخر.
-3. انقر نقرًا مزدوجًا على `Start-Books-Organizer.command`.
+3. افتح مجلد `macOS`، ثم انقر نقرًا مزدوجًا على `Start-Books-Organizer.command`.
 4. انتظر حتى ينتهي تنزيل الحزم في أول تشغيل. يفتح التطبيق في المتصفح تلقائيًا.
 
-ملفات التحكم على macOS:
+جميع ملفات التحكم الخاصة بـmacOS موجودة داخل مجلد `macOS`:
 
-- `Start-Books-Organizer.command` يشغل التطبيق.
-- `Stop-Books-Organizer.command` يوقفه.
-- `Restart-Books-Organizer.command` يعيد تشغيله.
+- `macOS/Start-Books-Organizer.command` يشغل التطبيق.
+- `macOS/Stop-Books-Organizer.command` يوقفه.
+- `macOS/Restart-Books-Organizer.command` يعيد تشغيله.
 
 إذا رفض macOS فتح الملف في المرة الأولى، انقر عليه بزر الفأرة الأيمن واختر `Open`. إذا ظهرت رسالة بأن الملف غير قابل للتنفيذ، افتح Terminal داخل مجلد التطبيق ونفّذ:
 
 ```sh
-chmod +x Start-Books-Organizer.command Stop-Books-Organizer.command Restart-Books-Organizer.command
+chmod +x macOS/Start-Books-Organizer.command macOS/Stop-Books-Organizer.command macOS/Restart-Books-Organizer.command
 ```
 
 يعمل الخادم في الخلفية على Windows وmacOS، لذلك لا تحتاج نافذة Command Prompt أو Terminal إلى البقاء مفتوحة.

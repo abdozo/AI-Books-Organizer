@@ -63,6 +63,40 @@ def test_selected_books_move_to_a_topic_without_changing_other_books(tmp_path):
     assert library.get_book(first["id"])["history"][0]["text"] == "نُقل من موضوع تاريخ إلى حديث"
 
 
+def test_deleting_books_cascades_related_data_but_keeps_original_pdf(tmp_path):
+    pdf = tmp_path / "original.pdf"
+    pdf.write_bytes(b"%PDF-test")
+    library = Library(tmp_path / "data")
+    deleted_book = library.create_referenced_book(pdf, 4)
+    kept_book = library.create_manual_book({"title": "كتاب باقٍ", "author": "المؤلف"})
+    scan_id = library.create_scan([deleted_book["id"]], 4)
+
+    with pytest.raises(ValueError, match="فحص جارٍ"):
+        library.delete_books([deleted_book["id"]])
+
+    library.update_scan(scan_id, state="cancelled")
+    assert library.delete_books([deleted_book["id"], deleted_book["id"]]) == 1
+    assert [book["id"] for book in library.list_books()] == [kept_book["id"]]
+    assert pdf.is_file()
+    with library.connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM book_history WHERE book_id=?", (deleted_book["id"],)
+        ).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM scan_items WHERE book_id=?", (deleted_book["id"],)
+        ).fetchone()[0] == 0
+
+
+def test_deleting_books_is_atomic_when_one_id_is_missing(tmp_path):
+    library = Library(tmp_path)
+    book = library.create_manual_book({"title": "كتاب باقٍ"})
+
+    with pytest.raises(KeyError, match="أحد الكتب"):
+        library.delete_books([book["id"], "missing-book"])
+
+    assert library.get_book(book["id"])["title"] == "كتاب باقٍ"
+
+
 def test_prompt_and_model_settings_do_not_contain_a_schema_column(tmp_path):
     library = Library(tmp_path)
     library.save_settings("تعليمات مخصصة", "gemini-test-model")

@@ -186,6 +186,7 @@
     filtersOpen: false,
     selectedBooks: new Set(),
     movingBookIds: [],
+    deletingBookIds: [],
     topic: "all",
     author: "all",
     publisher: "all",
@@ -290,13 +291,6 @@
     return "failed";
   }
 
-  function formatDate(value) {
-    if (!value) return "";
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return value;
-    return new Intl.DateTimeFormat("ar-EG", { dateStyle: "medium", timeStyle: "short" }).format(date);
-  }
-
   function listValues(key) {
     return [...new Set(state.books.map((book) => book[key]).filter(Boolean))]
       .sort((a, b) => a.localeCompare(b, "ar"));
@@ -370,11 +364,11 @@
     ].filter(Boolean);
     return `<tr data-book-id="${book.id}">
       <td><div class="book-name">${selectable ? `<input class="book-check" type="checkbox" data-select-book="${book.id}" ${state.selectedBooks.has(book.id) ? "checked" : ""} aria-label="تحديد ${esc(book.title || book.file)}">` : ""}<span class="cover">${esc((book.title || book.file || "ك").slice(0, 1))}</span><div><strong>${esc(book.title || "بلا عنوان")}</strong><small>${esc(book.file)}</small></div></div></td>
-      <td class="${book.author ? "" : "missing"}">${esc(book.author || "لم يُعثر عليه")}</td>
-      <td class="${book.editor ? "" : "missing"}">${esc(book.editor || "لم يُعثر عليه")}</td>
-      <td class="${book.publisher ? "" : "missing"}">${esc(book.publisher || "لم يُعثر عليه")}</td>
+      <td class="${book.author ? "" : "missing"}">${esc(book.author || "بدون")}</td>
+      <td class="${book.editor ? "" : "missing"}">${esc(book.editor || "بدون")}</td>
+      <td class="${book.publisher ? "" : "missing"}">${esc(book.publisher || "بدون")}</td>
       <td class="${publication.length ? "publication-meta" : "missing"}">${publication.length ? publication.map((value) => `<small>${esc(value)}</small>`).join("") : "لم يُعثر عليها"}</td>
-      <td class="${book.topic ? "" : "missing"}">${esc(book.topic || "لم يُعثر عليه")}</td>
+      <td class="${book.topic ? "" : "missing"}">${esc(book.topic || "بدون")}</td>
       <td><span class="status ${statusClass(book.status)}">${statusLabel(book.status)}</span></td>
       <td><button class="row-menu" data-row-menu="${book.id}" aria-label="تعديل ${esc(book.title)}">⋯</button></td>
     </tr>`;
@@ -391,7 +385,7 @@
     const filterCount = state.statuses.size
       + [state.topic, state.author, state.publisher].filter((value) => value !== "all").length;
     $("#routeHost").innerHTML = `
-      <div class="page-head"><div><h1>الكتب</h1><p>${state.books.length} كتابًا في المكتبة المحلية</p></div><div class="actions"><button class="btn selection-btn" id="moveBooks" ${state.selectedBooks.size ? "" : "disabled"}>نقل إلى موضوع${state.selectedBooks.size ? ` (${state.selectedBooks.size})` : ""}</button><button class="btn export-btn" id="exportBooks" ${state.selectedBooks.size ? "" : "disabled"}>تصدير المحدد إلى Word${state.selectedBooks.size ? ` (${state.selectedBooks.size})` : ""}</button><button class="btn" data-action="add-file">إضافة ملف PDF</button><button class="btn" data-action="manual">إضافة كتاب يدويًا</button><button class="btn btn-primary" data-action="folder">فحص مجلد</button></div></div>
+      <div class="page-head"><div><h1>الكتب</h1><p>${state.books.length} كتابًا في المكتبة المحلية</p></div><div class="actions"><button class="btn selection-btn" id="moveBooks" ${state.selectedBooks.size ? "" : "disabled"}>نقل إلى موضوع${state.selectedBooks.size ? ` (${state.selectedBooks.size})` : ""}</button><button class="btn btn-danger selection-btn" id="deleteBooks" ${state.selectedBooks.size ? "" : "disabled"}>حذف المحدد${state.selectedBooks.size ? ` (${state.selectedBooks.size})` : ""}</button><button class="btn export-btn" id="exportBooks" ${state.selectedBooks.size ? "" : "disabled"}>تصدير المحدد إلى Word${state.selectedBooks.size ? ` (${state.selectedBooks.size})` : ""}</button><button class="btn" data-action="add-file">إضافة ملف PDF</button><button class="btn" data-action="manual">إضافة كتاب يدويًا</button><button class="btn btn-primary" data-action="folder">فحص مجلد</button></div></div>
       <div class="library-layout"><div class="books-panel"><div class="library-tools"><div class="search-tools"><label class="search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="bookSearch" value="${esc(state.query)}" placeholder="ابحث في الكتب"></label><select class="search-mode-select" id="bookSearchMode" aria-label="طريقة البحث" title="اختر بين البحث بالكلمات والصيغ القريبة أو مطابقة العبارة">${searchModeOptions(state.searchMode)}</select></div><button class="btn filter-toggle ${filterCount ? "active" : ""}" id="toggleFilters" type="button" aria-expanded="${state.filtersOpen}" aria-controls="bookFilters"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 6h16M7 12h10m-7 6h4"/></svg><span>تصفية</span>${filterCount ? `<span class="filter-count">${filterCount}</span>` : ""}<span class="filter-chevron" aria-hidden="true">⌄</span></button><select class="sort" id="sortBooks" aria-label="ترتيب الكتب"><option value="relevance" ${state.sort === "relevance" ? "selected" : ""}>الأكثر صلة</option><option value="recent" ${state.sort === "recent" ? "selected" : ""}>آخر تحديث</option><option value="title" ${state.sort === "title" ? "selected" : ""}>العنوان</option><option value="author" ${state.sort === "author" ? "selected" : ""}>المؤلف</option></select></div>
           <section class="filter-menu" id="bookFilters" aria-label="خيارات تصفية الكتب" ${state.filtersOpen ? "" : "hidden"}>
             <div class="filter-group"><label>الحالة</label><div class="status-filters">${[["complete", "مكتمل"], ["review", "يحتاج مراجعة"], ["failed", "تعذر الفحص"]].map(([value, label]) => `<label class="check"><input type="checkbox" data-status="${value}" ${state.statuses.has(value) ? "checked" : ""}><span>${label}</span><em>${state.books.filter((book) => statusClass(book.status) === value).length}</em></label>`).join("")}</div></div>
@@ -443,6 +437,7 @@
       };
     });
     $("#moveBooks").onclick = () => openMoveBooks([...state.selectedBooks]);
+    $("#deleteBooks").onclick = () => openDeleteBooks([...state.selectedBooks]);
     $("#exportBooks").onclick = exportSelectedBooks;
     $$("[data-book-id]").forEach((row) => row.onclick = () => go(`book/${row.dataset.bookId}`));
     $$("[data-row-menu]").forEach((button) => button.onclick = (event) => {
@@ -530,7 +525,7 @@
 
   function detailMetadataValue(book, key, label) {
     const value = book[key];
-    if (!value) return '<strong class="missing">لم يُعثر عليه</strong>';
+    if (!value) return '<strong class="missing">بدون</strong>';
     const route = detailEntityRoutes[key];
     return route ? `<a class="metadata-link" href="#/${route}/${encodeURIComponent(value)}" aria-label="فتح صفحة ${esc(label)}: ${esc(value)}">${esc(value)}</a>` : `<strong>${esc(value)}</strong>`;
   }
@@ -538,10 +533,9 @@
   function renderDetail() {
     const book = currentBook();
     if (!book) { go("books"); return; }
-    const history = book.history || [];
     $("#routeHost").innerHTML = `
-      <div class="detail-head"><button class="btn btn-icon back" id="backBooks">←</button><div><h1>${esc(book.title)}</h1><p>${esc(book.file)}</p></div><span class="status ${statusClass(book.status)}">${statusLabel(book.status)}</span><div class="actions"><button class="btn" id="openPdf" ${book.pageCount ? "" : "disabled"}>فتح ملف PDF</button><button class="btn" id="openBookFolder" ${book.fullPath ? "" : "disabled"}>فتح المجلد</button><button class="btn" id="moveBookTopic">نقل إلى موضوع</button><button class="btn" id="editBook">تعديل البيانات</button><button class="btn btn-primary" id="rescanBook" ${book.pageCount ? "" : "disabled"}>إعادة توليد البيانات</button></div></div>
-      <div class="detail-layout"><div><section class="card metadata"><div class="metadata-grid">${fields.map(([key, label]) => `<div class="meta-row"><span>${label}</span>${detailMetadataValue(book, key, label)}</div>`).join("")}<div class="meta-row"><span>الثقة</span><strong>${book.confidence}%</strong></div><div class="meta-row"><span>الصفحات المفحوصة</span><strong>${book.pagesChecked} من ${book.maxPages}</strong></div></div><div class="path-box"><strong>المسار الكامل على الجهاز</strong><br>${esc(book.fullPath || "لا يوجد ملف مرتبط بهذا الكتاب")}</div>${book.error ? `<div class="impact missing">${esc(book.error)}</div>` : ""}</section><section class="card history"><div class="card-head"><h2>سجل الكتاب</h2></div><div style="padding:0 14px">${history.length ? history.map((entry) => `<div class="history-row"><time>${esc(formatDate(entry.date))}</time><span>${esc(entry.text)}</span><small>المحاولة ${entry.attempt || book.attempts}</small></div>`).join("") : '<div class="empty">لا توجد أحداث مسجلة</div>'}</div></section></div><aside class="card pdf-preview"><div class="pdf-page"><span>صفحة العنوان</span><strong>${esc(book.title)}</strong><span>${esc(book.author || "المؤلف غير معروف")}</span></div></aside></div>`;
+      <div class="detail-head"><button class="btn btn-icon back" id="backBooks">→</button><div><h1>${esc(book.title)}</h1><p>${esc(book.file)}</p></div><span class="status ${statusClass(book.status)}">${statusLabel(book.status)}</span><div class="actions"><button class="btn" id="openPdf" ${book.pageCount ? "" : "disabled"}>فتح ملف PDF</button><button class="btn" id="openBookFolder" ${book.fullPath ? "" : "disabled"}>فتح المجلد</button><button class="btn" id="moveBookTopic">نقل إلى موضوع</button><button class="btn" id="editBook">تعديل البيانات</button><button class="btn btn-danger" id="deleteBook">حذف الكتاب</button><button class="btn btn-primary" id="rescanBook" ${book.pageCount ? "" : "disabled"}>إعادة توليد البيانات</button></div></div>
+      <div class="detail-layout"><section class="card metadata"><div class="metadata-grid">${fields.map(([key, label]) => `<div class="meta-row"><span>${label}</span>${detailMetadataValue(book, key, label)}</div>`).join("")}<div class="meta-row"><span>الثقة</span><strong>${book.confidence}%</strong></div><div class="meta-row"><span>الصفحات المفحوصة</span><strong>${book.pagesChecked} من ${book.maxPages}</strong></div></div><div class="path-box"><strong>المسار الكامل على الجهاز</strong><br>${esc(book.fullPath || "لا يوجد ملف مرتبط بهذا الكتاب")}</div>${book.error ? `<div class="impact missing">${esc(book.error)}</div>` : ""}</section><aside class="card pdf-preview"><div class="pdf-page"><span>صفحة العنوان</span><strong>${esc(book.title)}</strong><span>${esc(book.author || "المؤلف غير معروف")}</span></div></aside></div>`;
     $("#backBooks").onclick = () => go("books");
     $("#openPdf").onclick = () => window.open(`/api/books/${book.id}/pdf`, "_blank", "noopener");
     $("#openBookFolder").onclick = async () => {
@@ -553,6 +547,7 @@
     };
     $("#moveBookTopic").onclick = () => openMoveBooks([book.id]);
     $("#editBook").onclick = () => openEdit(book.id);
+    $("#deleteBook").onclick = () => openDeleteBooks([book.id]);
     $("#rescanBook").onclick = () => openRescan(book.id);
   }
 
@@ -783,6 +778,56 @@
       );
     } catch (error) {
       toast("تعذر نقل الكتب", error.message, "error");
+    }
+  }
+
+  function openDeleteBooks(bookIds) {
+    const books = [...new Set(bookIds)]
+      .map((id) => state.books.find((book) => book.id === id))
+      .filter(Boolean);
+    if (!books.length) return;
+    state.deletingBookIds = books.map((book) => book.id);
+    $("#deleteBooksTitle").textContent = books.length === 1 ? "حذف الكتاب" : "حذف الكتب المحددة";
+    $("#deleteBooksImpact").textContent = books.length === 1
+      ? `سيُحذف «${books[0].title}» وبيانات فهرسته من المكتبة. لن يظهر بعد ذلك في صفحات المؤلف أو الموضوع أو بقية الفهارس.`
+      : `سيُحذف ${books.length} من الكتب وبيانات فهرستها من المكتبة. ستُحدّث صفحات المؤلفين والموضوعات وبقية الفهارس تلقائيًا.`;
+    $("#confirmDeleteBooksBtn").textContent = books.length === 1 ? "حذف الكتاب" : "حذف الكتب";
+    openModal("deleteBooksModal");
+  }
+
+  async function deleteBooks() {
+    const bookIds = [...state.deletingBookIds];
+    if (!bookIds.length) return;
+    const button = $("#confirmDeleteBooksBtn");
+    button.disabled = true;
+    button.textContent = "جارٍ الحذف";
+    try {
+      const result = await api("/api/books", {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ book_ids: bookIds }),
+      });
+      const deletingCurrentBook = state.route.startsWith("book/")
+        && bookIds.includes(state.route.split("/")[1]);
+      bookIds.forEach((id) => state.selectedBooks.delete(id));
+      state.deletingBookIds = [];
+      closeModal("deleteBooksModal");
+      await refreshData(false);
+      if (deletingCurrentBook) {
+        state.route = "books";
+        history.replaceState(null, "", "#/books");
+      }
+      render();
+      toast(
+        result.deleted === 1 ? "تم حذف الكتاب" : "تم حذف الكتب",
+        result.deleted === 1 ? "حُذفت بياناته من المكتبة" : `حُذف ${result.deleted} من الكتب من المكتبة`,
+      );
+    } catch (error) {
+      toast("تعذر حذف الكتب", error.message, "error");
+    } finally {
+      button.disabled = false;
+      if (state.deletingBookIds.length) {
+        button.textContent = state.deletingBookIds.length === 1 ? "حذف الكتاب" : "حذف الكتب";
+      }
     }
   }
 
@@ -1078,6 +1123,7 @@
     };
     $("#saveEntityMergeBtn").onclick = saveEntityMerge;
     $("#saveBookMoveBtn").onclick = saveBookMove;
+    $("#confirmDeleteBooksBtn").onclick = deleteBooks;
     $$("[data-close]").forEach((button) => button.onclick = () => closeModal(button.dataset.close));
     $$(".modal-backdrop").forEach((modal) => modal.onclick = (event) => { if (event.target === modal) closeModal(modal.id); });
     window.addEventListener("hashchange", parseRoute);

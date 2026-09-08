@@ -67,6 +67,21 @@ def test_selected_or_single_books_can_move_to_another_topic():
     assert 'list="moveTopicOptions"' in html
 
 
+def test_selected_or_single_books_can_be_deleted_after_confirmation():
+    source = APP_JS.read_text(encoding="utf-8")
+    html = APP_HTML.read_text(encoding="utf-8")
+
+    assert 'id="deleteBooks"' in source
+    assert 'id="deleteBook"' in source
+    assert 'api("/api/books"' in source
+    assert 'method: "DELETE"' in source
+    assert 'id="deleteBooksModal"' in html
+    assert 'role="alertdialog"' in html
+    assert 'id="confirmDeleteBooksBtn"' in html
+    assert "لن يُحذف ملف PDF الأصلي من جهازك" in html
+    assert "سجل الكتاب" not in source
+
+
 def test_folder_scan_has_depth_and_per_folder_pdf_limits():
     html = APP_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")

@@ -15,6 +15,7 @@ from .exporter import build_books_docx
 from .gemini import inspect_pdf
 from .importer import discover_pdfs, local_pdf
 from .models import (
+    BookDeleteInput,
     BookExportInput,
     BookInput,
     BookMoveInput,
@@ -145,6 +146,11 @@ def create_app(data_root: Path | None = None, secret_store: SecretStore | None =
     def move_books(payload: BookMoveInput) -> dict[str, int]:
         affected = library.move_books_to_topic(payload.book_ids, payload.topic)
         return {"affected": affected}
+
+    @app.delete("/api/books")
+    def delete_books(payload: BookDeleteInput) -> dict[str, int]:
+        deleted = library.delete_books(payload.book_ids)
+        return {"deleted": deleted}
 
     @app.patch("/api/books/{book_id}")
     def update_book(book_id: str, payload: BookInput) -> dict[str, Any]:

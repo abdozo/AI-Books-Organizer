@@ -1,6 +1,6 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0.."
 title Update AI Books Organizer
 
 if not exist ".git" goto not_a_git_clone
@@ -9,7 +9,7 @@ where git >nul 2>&1
 if errorlevel 1 goto git_not_found
 
 echo Stopping AI Books Organizer...
-call Stop-Books-Organizer.bat
+call "%~dp0Stop-Books-Organizer.bat"
 if errorlevel 1 goto stop_failed
 
 echo Switching to the main branch...
@@ -21,7 +21,7 @@ git pull --ff-only origin main
 if errorlevel 1 goto update_failed
 
 echo Starting AI Books Organizer...
-call Start-Books-Organizer.bat
+call "%~dp0Start-Books-Organizer.bat"
 if errorlevel 1 goto start_failed
 
 echo.
