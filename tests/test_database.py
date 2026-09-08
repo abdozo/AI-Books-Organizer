@@ -47,6 +47,22 @@ def test_manual_books_and_entity_changes_are_persisted(tmp_path):
     assert library.get_book(second["id"])["status"] == "review"
 
 
+def test_selected_books_move_to_a_topic_without_changing_other_books(tmp_path):
+    library = Library(tmp_path)
+    first = library.create_manual_book({"title": "كتاب أول", "topic": "تاريخ"})
+    second = library.create_manual_book({"title": "كتاب ثان", "topic": "فقه"})
+    untouched = library.create_manual_book({"title": "كتاب ثالث", "topic": "تاريخ"})
+
+    affected = library.move_books_to_topic([first["id"], second["id"]], "حديث")
+
+    assert affected == 2
+    assert library.get_book(first["id"])["topic"] == "حديث"
+    assert library.get_book(second["id"])["topic"] == "حديث"
+    assert library.get_book(untouched["id"])["topic"] == "تاريخ"
+    assert library.get_book(first["id"])["status"] == "complete"
+    assert library.get_book(first["id"])["history"][0]["text"] == "نُقل من موضوع تاريخ إلى حديث"
+
+
 def test_prompt_and_model_settings_do_not_contain_a_schema_column(tmp_path):
     library = Library(tmp_path)
     library.save_settings("تعليمات مخصصة", "gemini-test-model")
@@ -103,3 +119,28 @@ def test_scan_results_persist_publication_fields(tmp_path):
     assert saved["publication_year"] == "٢٠٢٦"
     assert saved["edition_number"] == "الرابعة"
     assert saved["volume_number"] == "٥"
+
+
+def test_existing_scan_table_is_migrated_for_rate_limit_state(tmp_path):
+    database = tmp_path / "library.sqlite3"
+    with sqlite3.connect(database) as db:
+        db.execute("""CREATE TABLE scans (
+            id TEXT PRIMARY KEY, state TEXT NOT NULL, max_pages INTEGER NOT NULL,
+            current_index INTEGER NOT NULL DEFAULT 0, current_page INTEGER NOT NULL DEFAULT 0,
+            paused INTEGER NOT NULL DEFAULT 0, cancel_requested INTEGER NOT NULL DEFAULT 0,
+            skip_requested INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+
+    library = Library(tmp_path)
+    with library.connect() as db:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(scans)")}
+
+    assert {
+        "model", "buffer_until", "rate_limit_rpm", "rate_limit_rpd", "rate_limit_window",
+    } <= columns
+    with library.connect() as db:
+        quota_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(api_request_reservations)")
+        }
+    assert {"model", "reserved_at"} <= quota_columns

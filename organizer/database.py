@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -59,8 +58,13 @@ CREATE TABLE IF NOT EXISTS scans (
   id TEXT PRIMARY KEY,
   state TEXT NOT NULL,
   max_pages INTEGER NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
   current_index INTEGER NOT NULL DEFAULT 0,
   current_page INTEGER NOT NULL DEFAULT 0,
+  buffer_until INTEGER NOT NULL DEFAULT 0,
+  rate_limit_rpm INTEGER NOT NULL DEFAULT 0,
+  rate_limit_rpd INTEGER NOT NULL DEFAULT 0,
+  rate_limit_window TEXT NOT NULL DEFAULT '',
   paused INTEGER NOT NULL DEFAULT 0,
   cancel_requested INTEGER NOT NULL DEFAULT 0,
   skip_requested INTEGER NOT NULL DEFAULT 0,
@@ -76,8 +80,15 @@ CREATE TABLE IF NOT EXISTS scan_items (
   state TEXT NOT NULL DEFAULT 'waiting',
   UNIQUE(scan_id, position)
 );
+CREATE TABLE IF NOT EXISTS api_request_reservations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  model TEXT NOT NULL,
+  reserved_at REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS books_updated ON books(updated_at DESC);
 CREATE INDEX IF NOT EXISTS scan_items_scan ON scan_items(scan_id, position);
+CREATE INDEX IF NOT EXISTS api_requests_model_time
+ON api_request_reservations(model, reserved_at);
 """
 
 
@@ -85,8 +96,6 @@ class Library:
     def __init__(self, root: Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        self.books_root = self.root / "books"
-        self.books_root.mkdir(exist_ok=True)
         self.db_path = self.root / "library.sqlite3"
         self._migrate()
 
@@ -117,6 +126,17 @@ class Library:
             for column in ("publication_year", "edition_number", "volume_number"):
                 if column not in book_columns:
                     db.execute(f"ALTER TABLE books ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+            scan_columns = {row[1] for row in db.execute("PRAGMA table_info(scans)")}
+            scan_migrations = {
+                "model": "TEXT NOT NULL DEFAULT ''",
+                "buffer_until": "INTEGER NOT NULL DEFAULT 0",
+                "rate_limit_rpm": "INTEGER NOT NULL DEFAULT 0",
+                "rate_limit_rpd": "INTEGER NOT NULL DEFAULT 0",
+                "rate_limit_window": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in scan_migrations.items():
+                if column not in scan_columns:
+                    db.execute(f"ALTER TABLE scans ADD COLUMN {column} {definition}")
             db.execute("INSERT OR IGNORE INTO settings VALUES ('prompt', ?)", (DEFAULT_PROMPT,))
             for previous_prompt in PREVIOUS_DEFAULT_PROMPTS:
                 db.execute(
@@ -192,38 +212,38 @@ class Library:
             self._history(db, book_id, "أُضيف يدويًا")
         return self.get_book(book_id)
 
-    def create_uploaded_book(self, file_name: str, data: bytes, source_label: str, page_count: int) -> dict[str, Any]:
-        safe_name = Path(file_name).name
-        if Path(safe_name).suffix.lower() != ".pdf":
-            raise ValueError("اختر ملف PDF صالحًا")
-        if not data.startswith(b"%PDF"):
-            raise ValueError("الملف المرفوع ليس PDF صالحًا")
-        if len(data) > 500 * 1024 * 1024:
-            raise ValueError("حجم ملف PDF يتجاوز 500 ميجابايت")
-        book_id = uuid.uuid4().hex
-        folder = self.books_root / book_id
-        folder.mkdir()
-        target = folder / "source.pdf"
-        target.write_bytes(data)
+    def create_referenced_books(self, entries: list[tuple[Path, int]]) -> list[str]:
+        if not entries:
+            return []
         now = utc_now()
-        try:
-            with self.transaction() as db:
+        book_ids: list[str] = []
+        with self.transaction() as db:
+            for path, page_count in entries:
+                book_id = uuid.uuid4().hex
+                book_ids.append(book_id)
                 db.execute(
                     """INSERT INTO books
                        (id,title,status,file_name,stored_path,source_label,page_count,created_at,updated_at)
                        VALUES (?,?,'waiting',?,?,?,?,?,?)""",
-                    (book_id, Path(safe_name).stem, safe_name, str(target), source_label, page_count, now, now),
+                    (book_id, path.stem, path.name, str(path), str(path), page_count, now, now),
                 )
                 self._history(db, book_id, "أُضيف إلى المكتبة وينتظر الفحص")
-        except Exception:
-            shutil.rmtree(folder, ignore_errors=True)
-            raise
+        return book_ids
+
+    def create_referenced_book(self, path: Path, page_count: int) -> dict[str, Any]:
+        book_id = self.create_referenced_books([(path, page_count)])[0]
         return self.get_book(book_id)
 
     def _book_dict(self, row: sqlite3.Row, history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         book = dict(row)
         book["file"] = book.pop("file_name")
-        book["path"] = book.pop("source_label") or book.get("stored_path", "")
+        source_label = book.pop("source_label")
+        stored_path = book.get("stored_path", "")
+        source_path = Path(source_label).expanduser() if source_label else None
+        managed_path = Path(stored_path).resolve() if stored_path else None
+        source_is_real = bool(source_path and source_path.is_absolute() and source_path.exists())
+        book["path"] = source_label or stored_path
+        book["fullPath"] = str(source_path if source_is_real else managed_path or "")
         book["pagesChecked"] = book.pop("pages_checked")
         book["maxPages"] = book.pop("max_pages")
         book["pageCount"] = book.pop("page_count")
@@ -265,6 +285,22 @@ class Library:
             raise FileNotFoundError("ملف PDF غير موجود على القرص")
         return path
 
+    def book_file_path(self, book_id: str) -> Path:
+        """Return the original PDF path, with legacy managed copies as fallback."""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT source_label,stored_path FROM books WHERE id=?", (book_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError("الكتاب غير موجود")
+        source = Path(row["source_label"]).expanduser() if row["source_label"] else None
+        if source and source.is_absolute() and source.exists():
+            return source
+        stored = Path(row["stored_path"]).resolve() if row["stored_path"] else None
+        if stored and stored.exists():
+            return stored
+        raise FileNotFoundError("ملف الكتاب غير موجود على القرص")
+
     def update_book(self, book_id: str, values: dict[str, str]) -> dict[str, Any]:
         now = utc_now()
         with self.transaction() as db:
@@ -284,6 +320,37 @@ class Library:
             )
             self._history(db, book_id, "عُدلت البيانات يدويًا", row["attempts"])
         return self.get_book(book_id)
+
+    def move_books_to_topic(self, book_ids: list[str], topic: str) -> int:
+        unique_ids = list(dict.fromkeys(book_id.strip() for book_id in book_ids if book_id.strip()))
+        topic = topic.strip()
+        if not unique_ids:
+            raise ValueError("اختر كتابًا واحدًا على الأقل")
+        if not topic:
+            raise ValueError("اختر الموضوع الذي ستُنقل إليه الكتب")
+        placeholders = ",".join("?" for _ in unique_ids)
+        now = utc_now()
+        with self.transaction() as db:
+            rows = db.execute(
+                f"SELECT id,topic,attempts FROM books WHERE id IN ({placeholders})",
+                unique_ids,
+            ).fetchall()
+            if len(rows) != len(unique_ids):
+                raise KeyError("تعذر العثور على أحد الكتب")
+            changed = [row for row in rows if row["topic"] != topic]
+            for row in changed:
+                db.execute(
+                    "UPDATE books SET topic=?,updated_at=? WHERE id=?",
+                    (topic, now, row["id"]),
+                )
+                previous = row["topic"]
+                event = (
+                    f"نُقل من موضوع {previous} إلى {topic}"
+                    if previous
+                    else f"نُقل إلى موضوع {topic}"
+                )
+                self._history(db, row["id"], event, row["attempts"])
+        return len(changed)
 
     def change_entities(self, field: str, names: list[str], canonical: str | None) -> int:
         if field not in ENTITY_FIELDS:
@@ -305,7 +372,7 @@ class Library:
                 self._history(db, row["id"], event, row["attempts"])
         return len(rows)
 
-    def create_scan(self, book_ids: list[str], max_pages: int) -> str:
+    def create_scan(self, book_ids: list[str], max_pages: int, model: str = "") -> str:
         unique_ids = list(dict.fromkeys(book_ids))
         scan_id = uuid.uuid4().hex
         now = utc_now()
@@ -320,8 +387,8 @@ class Library:
             if any(not found[book_id] for book_id in unique_ids):
                 raise ValueError("لا يمكن فحص كتاب أُضيف يدويًا من دون ملف PDF محفوظ")
             db.execute(
-                "INSERT INTO scans(id,state,max_pages,created_at,updated_at) VALUES (?,'queued',?,?,?)",
-                (scan_id, max_pages, now, now),
+                "INSERT INTO scans(id,state,max_pages,model,created_at,updated_at) VALUES (?,'queued',?,?,?,?)",
+                (scan_id, max_pages, model, now, now),
             )
             for position, book_id in enumerate(unique_ids):
                 db.execute(
@@ -333,6 +400,55 @@ class Library:
                     (max_pages, now, book_id),
                 )
         return scan_id
+
+    def reserve_api_request(
+        self,
+        model: str,
+        *,
+        reserved_at: float,
+        minute_seconds: float,
+        day_seconds: float,
+        minute_limit: int,
+        day_limit: int,
+    ) -> tuple[float, str, int, int]:
+        """Atomically reserve an API request across app processes and restarts."""
+        if minute_limit < 1 or day_limit < 1:
+            raise ValueError("حدود طلبات النموذج غير صالحة")
+        minute_cutoff = reserved_at - minute_seconds
+        day_cutoff = reserved_at - day_seconds
+        with self.transaction() as db:
+            db.execute(
+                "DELETE FROM api_request_reservations WHERE reserved_at<=?",
+                (day_cutoff,),
+            )
+            request_times = [
+                float(row[0])
+                for row in db.execute(
+                    """SELECT reserved_at FROM api_request_reservations
+                       WHERE model=? AND reserved_at>? ORDER BY reserved_at""",
+                    (model, day_cutoff),
+                )
+            ]
+            minute_times = [timestamp for timestamp in request_times if timestamp > minute_cutoff]
+            minute_wait = (
+                max(0.0, minute_times[0] + minute_seconds - reserved_at)
+                if len(minute_times) >= minute_limit
+                else 0.0
+            )
+            day_wait = (
+                max(0.0, request_times[0] + day_seconds - reserved_at)
+                if len(request_times) >= day_limit
+                else 0.0
+            )
+            wait_seconds = max(minute_wait, day_wait)
+            if wait_seconds > 0:
+                window = "day" if day_wait >= minute_wait else "minute"
+                return wait_seconds, window, len(minute_times), len(request_times)
+            db.execute(
+                "INSERT INTO api_request_reservations(model,reserved_at) VALUES (?,?)",
+                (model, reserved_at),
+            )
+            return 0.0, "", len(minute_times) + 1, len(request_times) + 1
 
     def latest_scan(self) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -350,6 +466,10 @@ class Library:
         result["maxPages"] = result.pop("max_pages")
         result["currentIndex"] = result.pop("current_index")
         result["currentPage"] = result.pop("current_page")
+        result["bufferUntil"] = result.pop("buffer_until")
+        result["rateLimitRpm"] = result.pop("rate_limit_rpm")
+        result["rateLimitRpd"] = result.pop("rate_limit_rpd")
+        result["rateLimitWindow"] = result.pop("rate_limit_window")
         result["cancelRequested"] = bool(result.pop("cancel_requested"))
         result["skipRequested"] = bool(result.pop("skip_requested"))
         result["paused"] = bool(result["paused"])
@@ -372,7 +492,11 @@ class Library:
             )]
 
     def update_scan(self, scan_id: str, **fields: Any) -> None:
-        allowed = {"state", "current_index", "current_page", "paused", "cancel_requested", "skip_requested", "error"}
+        allowed = {
+            "state", "current_index", "current_page", "paused", "cancel_requested",
+            "skip_requested", "error", "buffer_until", "rate_limit_rpm",
+            "rate_limit_rpd", "rate_limit_window",
+        }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"حقول فحص غير صالحة: {unknown}")

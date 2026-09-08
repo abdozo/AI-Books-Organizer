@@ -11,6 +11,8 @@ from uuid import uuid4
 
 import uvicorn
 
+from organizer.runtime_revision import application_revision
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -21,11 +23,12 @@ def runtime_file() -> Path:
     return data_root / "server.json"
 
 
-def write_runtime(path: Path, *, port: int, instance_id: str) -> None:
+def write_runtime(path: Path, *, port: int, instance_id: str, revision: str) -> None:
     payload = {
         "pid": os.getpid(),
         "port": port,
         "instanceId": instance_id,
+        "revision": revision,
         "startedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     temporary = path.with_suffix(".tmp")
@@ -58,7 +61,12 @@ if __name__ == "__main__":
     instance_id = uuid4().hex
     os.environ["AI_BOOKS_INSTANCE_ID"] = instance_id
     state_path = runtime_file()
-    write_runtime(state_path, port=port, instance_id=instance_id)
+    write_runtime(
+        state_path,
+        port=port,
+        instance_id=instance_id,
+        revision=application_revision(PROJECT_ROOT),
+    )
     if os.environ.get("AI_BOOKS_NO_BROWSER") != "1":
         threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
     try:

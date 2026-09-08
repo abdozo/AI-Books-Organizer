@@ -17,17 +17,6 @@
     ["volume_number", "رقم المجلد"],
     ["topic", "الموضوع"],
   ];
-  const geminiModels = [
-    { value: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash Lite", dailyRequests: 500 },
-    { value: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash Lite", dailyRequests: 500 },
-    { value: "gemini-3.8-flash", label: "Gemini 3.8 Flash", dailyRequests: 20 },
-    { value: "gemini-3.5-flash", label: "Gemini 3.5 Flash", dailyRequests: 20 },
-    { value: "gemini-3.7-flash", label: "Gemini 3.7 Flash", dailyRequests: 20 },
-    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash", dailyRequests: 20 },
-    { value: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite", dailyRequests: 20 },
-    { value: "gemini-3-flash-preview", label: "Gemini 3 Flash", dailyRequests: 20 },
-    { value: "gemini-3.6-flash", label: "Gemini 3.6 Flash", dailyRequests: 20 },
-  ];
   const entityTypes = {
     authors: { key: "author", title: "المؤلفون", singular: "المؤلف" },
     topics: { key: "topic", title: "الموضوعات", singular: "الموضوع" },
@@ -37,19 +26,170 @@
   const detailEntityRoutes = {
     author: "authors", editor: "editors", publisher: "publishers", topic: "topics",
   };
+  const searchModes = {
+    flexible: "بحث مرن",
+    phrase: "مطابقة العبارة",
+  };
+  const searchModeStorageKey = "ai-books-organizer.search-mode";
+  const arabicSearchStopWords = new Set([
+    "في", "من", "الي", "على", "عن", "مع", "او", "ثم", "هذا", "هذه", "ذلك", "تلك",
+    "الذي", "التي", "الذين", "هو", "هي",
+  ]);
+
+  function normalizeSearchText(value) {
+    return String(value ?? "")
+      .normalize("NFKC")
+      .replace(/[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed]/g, "")
+      .replace(/ـ/g, "")
+      .replace(/[أإآٱ]/g, "ا")
+      .replace(/ؤ/g, "و")
+      .replace(/ئ/g, "ي")
+      .replace(/ى/g, "ي")
+      .replace(/ة/g, "ه")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function searchTokens(value) {
+    return normalizeSearchText(value).match(/[\p{L}\p{N}]+/gu) || [];
+  }
+
+  function lightArabicStem(token) {
+    if (!/[\u0600-\u06ff]/.test(token)) return token;
+    let stem = token;
+    const prefix = ["وال", "فال", "بال", "كال", "لل", "ال"].find((item) => stem.startsWith(item) && stem.length - item.length >= 3);
+    if (prefix) stem = stem.slice(prefix.length);
+    for (let pass = 0; pass < 2; pass += 1) {
+      const suffix = ["يات", "كما", "هما", "اتهم", "ات", "ون", "ين", "ان", "اء", "ها", "هم", "هن", "نا", "ه", "ي"].find((item) => stem.endsWith(item) && stem.length - item.length >= 3);
+      if (!suffix) break;
+      stem = stem.slice(0, -suffix.length);
+    }
+    return stem;
+  }
+
+  function arabicRootKey(token) {
+    let root = lightArabicStem(token);
+    const derivedPrefix = ["مست", "است"].find((item) => root.startsWith(item) && root.length - item.length >= 3);
+    if (derivedPrefix) root = root.slice(derivedPrefix.length);
+    else if (/^[مت]/.test(root) && root.length > 4) root = root.slice(1);
+    const withoutWeakLetters = root.replace(/[اوي]/g, "");
+    return withoutWeakLetters.length >= 3 ? withoutWeakLetters : root;
+  }
+
+  function editDistance(left, right) {
+    const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+    for (let row = 1; row <= left.length; row += 1) {
+      let diagonal = previous[0];
+      previous[0] = row;
+      for (let column = 1; column <= right.length; column += 1) {
+        const above = previous[column];
+        previous[column] = Math.min(
+          previous[column] + 1,
+          previous[column - 1] + 1,
+          diagonal + (left[row - 1] === right[column - 1] ? 0 : 1),
+        );
+        diagonal = above;
+      }
+    }
+    return previous[right.length];
+  }
+
+  function tokenMatchScore(queryToken, textToken) {
+    if (queryToken === textToken) return 12;
+    const queryStem = lightArabicStem(queryToken);
+    const textStem = lightArabicStem(textToken);
+    if (queryStem === textStem) return 10;
+    if (arabicRootKey(queryStem) === arabicRootKey(textStem)) return 8;
+    if (Math.min(queryStem.length, textStem.length) >= 3
+      && (queryStem.includes(textStem) || textStem.includes(queryStem))) return 6;
+    const longest = Math.max(queryStem.length, textStem.length);
+    if (longest >= 4) {
+      const distance = editDistance(queryStem, textStem);
+      if (distance === 1) return 4;
+      if (longest >= 7 && distance === 2) return 2;
+    }
+    return 0;
+  }
+
+  function searchScore(query, weightedValues, mode = "flexible") {
+    const normalizedQuery = normalizeSearchText(query);
+    if (!normalizedQuery) return 1;
+    const fieldsToSearch = weightedValues
+      .map(({ value, weight }) => ({ text: normalizeSearchText(value), weight }))
+      .filter(({ text }) => text);
+    if (mode === "phrase") {
+      return fieldsToSearch.reduce((best, field) => {
+        if (!field.text.includes(normalizedQuery)) return best;
+        return Math.max(best, field.weight * (field.text.startsWith(normalizedQuery) ? 4 : 3));
+      }, 0);
+    }
+    let queryTokens = searchTokens(normalizedQuery);
+    if (queryTokens.length > 1) {
+      const meaningfulTokens = queryTokens.filter((token) => !arabicSearchStopWords.has(token));
+      if (meaningfulTokens.length) queryTokens = meaningfulTokens;
+    }
+    let score = 0;
+    let matchedTerms = 0;
+    queryTokens.forEach((queryToken) => {
+      let best = 0;
+      fieldsToSearch.forEach((field) => {
+        searchTokens(field.text).forEach((textToken) => {
+          best = Math.max(best, tokenMatchScore(queryToken, textToken) * field.weight);
+        });
+      });
+      if (best) {
+        matchedTerms += 1;
+        score += best;
+      }
+    });
+    if (!matchedTerms) return 0;
+    const coverageBonus = matchedTerms * 20;
+    const phraseBonus = fieldsToSearch.some((field) => field.text.includes(normalizedQuery)) ? 12 : 0;
+    return score + coverageBonus + phraseBonus;
+  }
+
+  function savedSearchMode() {
+    try {
+      const saved = localStorage.getItem(searchModeStorageKey);
+      return searchModes[saved] ? saved : "flexible";
+    } catch (_error) {
+      return "flexible";
+    }
+  }
+
+  function searchModeOptions(selectedMode) {
+    return Object.entries(searchModes)
+      .map(([value, label]) => `<option value="${value}" ${selectedMode === value ? "selected" : ""}>${label}</option>`)
+      .join("");
+  }
+
+  function updateSearchMode(value) {
+    state.searchMode = searchModes[value] ? value : "flexible";
+    try {
+      localStorage.setItem(searchModeStorageKey, state.searchMode);
+    } catch (_error) {
+      // The mode still applies until the page closes when browser storage is unavailable.
+    }
+  }
 
   const state = {
     books: [],
     scan: null,
+    models: [],
     settings: { prompt: "", model: "gemini-3.5-flash-lite", keySaved: false },
+    searchMode: savedSearchMode(),
     libraryLabel: "المكتبة المحلية",
     route: "books",
     query: "",
     statuses: new Set(),
+    filtersOpen: false,
+    selectedBooks: new Set(),
+    movingBookIds: [],
     topic: "all",
     author: "all",
     publisher: "all",
-    sort: "recent",
+    sort: "relevance",
     page: 1,
     pageSize: 8,
     editingId: null,
@@ -61,10 +201,11 @@
     selectedEntities: new Set(),
     entityAction: "",
     entityMode: "merge",
-    uploading: false,
+    importing: false,
   };
   let pendingFolder = "";
-  let pendingFiles = [];
+  let pendingFileCount = 0;
+  let folderPreviewSequence = 0;
   let pollTimer = null;
 
   async function api(path, options = {}) {
@@ -80,7 +221,10 @@
   async function refreshData(renderPage = true) {
     const data = await api("/api/bootstrap");
     state.books = data.books;
+    const bookIds = new Set(state.books.map((book) => book.id));
+    state.selectedBooks = new Set([...state.selectedBooks].filter((id) => bookIds.has(id)));
     state.scan = data.scan;
+    state.models = data.models;
     state.settings = data.settings;
     state.libraryLabel = data.libraryLabel;
     if (renderPage) render();
@@ -159,18 +303,25 @@
   }
 
   function filteredBooks() {
-    const query = state.query.toLowerCase();
-    const books = state.books.filter((book) => {
-      const text = fields.map(([key]) => book[key]).join(" ").toLowerCase();
-      return (!query || text.includes(query))
+    const fieldWeights = { title: 3, author: 2, editor: 2, topic: 2, publisher: 1.5 };
+    const books = state.books.map((book, index) => ({
+      book,
+      index,
+      score: searchScore(state.query, [
+        ...fields.map(([key]) => ({ value: book[key], weight: fieldWeights[key] || 1 })),
+        { value: book.file, weight: 1 },
+      ], state.searchMode),
+    })).filter(({ book, score }) => {
+      return score > 0
         && (!state.statuses.size || state.statuses.has(statusClass(book.status)))
         && (state.topic === "all" || book.topic === state.topic)
         && (state.author === "all" || book.author === state.author)
         && (state.publisher === "all" || book.publisher === state.publisher);
     });
-    if (state.sort === "title") books.sort((a, b) => a.title.localeCompare(b.title, "ar"));
-    if (state.sort === "author") books.sort((a, b) => a.author.localeCompare(b.author, "ar"));
-    return books;
+    if (state.sort === "relevance" && state.query.trim()) books.sort((a, b) => b.score - a.score || a.index - b.index);
+    if (state.sort === "title") books.sort((a, b) => a.book.title.localeCompare(b.book.title, "ar"));
+    if (state.sort === "author") books.sort((a, b) => a.book.author.localeCompare(b.book.author, "ar"));
+    return books.map(({ book }) => book);
   }
 
   function render() {
@@ -195,8 +346,11 @@
     $("#scanBadge").textContent = running ? Math.max(0, scan.items.length - done) : 0;
     $("#scanBadge").classList.toggle("live", Boolean(running));
     $("#scanIndicator").classList.toggle("idle", !running);
+    const bufferSeconds = running ? Math.max(0, Math.ceil(((scan.bufferUntil || 0) - Date.now()) / 1000)) : 0;
     $("#scanIndicatorText").textContent = running
-      ? (scan.paused ? "الفحص متوقف مؤقتًا" : `فحص ${Math.min(done + 1, scan.items.length)} من ${scan.items.length}`)
+      ? (scan.paused ? "الفحص متوقف مؤقتًا" : bufferSeconds
+        ? `انتظار حصة API، ${bufferSeconds} ث`
+        : `فحص ${Math.min(done + 1, scan.items.length)} من ${scan.items.length}`)
       : "لا يوجد فحص جارٍ";
     $("#sidebarPath").textContent = state.libraryLabel;
     $$("[data-route]").forEach((button) => {
@@ -208,14 +362,14 @@
           : entityTypes[root] ? entityTypes[root].title : "الكتب / تفاصيل الكتاب";
   }
 
-  function bookRow(book) {
+  function bookRow(book, selectable = false) {
     const publication = [
       book.publication_year && `السنة: ${book.publication_year}`,
       book.edition_number && `الطبعة: ${book.edition_number}`,
       book.volume_number && `المجلد: ${book.volume_number}`,
     ].filter(Boolean);
     return `<tr data-book-id="${book.id}">
-      <td><div class="book-name"><span class="cover">${esc((book.title || book.file || "ك").slice(0, 1))}</span><div><strong>${esc(book.title || "بلا عنوان")}</strong><small>${esc(book.file)}</small></div></div></td>
+      <td><div class="book-name">${selectable ? `<input class="book-check" type="checkbox" data-select-book="${book.id}" ${state.selectedBooks.has(book.id) ? "checked" : ""} aria-label="تحديد ${esc(book.title || book.file)}">` : ""}<span class="cover">${esc((book.title || book.file || "ك").slice(0, 1))}</span><div><strong>${esc(book.title || "بلا عنوان")}</strong><small>${esc(book.file)}</small></div></div></td>
       <td class="${book.author ? "" : "missing"}">${esc(book.author || "لم يُعثر عليه")}</td>
       <td class="${book.editor ? "" : "missing"}">${esc(book.editor || "لم يُعثر عليه")}</td>
       <td class="${book.publisher ? "" : "missing"}">${esc(book.publisher || "لم يُعثر عليه")}</td>
@@ -233,15 +387,20 @@
     const pages = Math.max(1, Math.ceil(all.length / state.pageSize));
     if (state.page > pages) state.page = pages;
     const rows = all.slice((state.page - 1) * state.pageSize, state.page * state.pageSize);
+    const pageSelected = rows.length > 0 && rows.every((book) => state.selectedBooks.has(book.id));
+    const filterCount = state.statuses.size
+      + [state.topic, state.author, state.publisher].filter((value) => value !== "all").length;
     $("#routeHost").innerHTML = `
-      <div class="page-head"><div><h1>الكتب</h1><p>${state.books.length} كتابًا في المكتبة المحلية</p></div><div class="actions"><button class="btn" data-action="add-file">إضافة ملف PDF</button><button class="btn" data-action="manual">إضافة كتاب يدويًا</button><button class="btn btn-primary" data-action="folder">فحص مجلد</button></div></div>
-      <div class="library-layout"><aside class="filters"><div class="filter-head"><strong>تصفية</strong><button class="link-btn" data-action="clear">مسح</button></div>
-        <div class="filter-group"><label>الحالة</label>${[["complete", "مكتمل"], ["review", "يحتاج مراجعة"], ["failed", "تعذر الفحص"]].map(([value, label]) => `<label class="check"><input type="checkbox" data-status="${value}" ${state.statuses.has(value) ? "checked" : ""}><span>${label}</span><em>${state.books.filter((book) => statusClass(book.status) === value).length}</em></label>`).join("")}</div>
-        <div class="filter-group"><label for="filterTopic">الموضوع</label><select class="select" id="filterTopic"><option value="all">كل الموضوعات</option>${listValues("topic").map((value) => `<option ${state.topic === value ? "selected" : ""}>${esc(value)}</option>`).join("")}</select></div>
-        <div class="filter-group"><label for="filterAuthor">المؤلف</label><select class="select" id="filterAuthor"><option value="all">كل المؤلفين</option>${listValues("author").map((value) => `<option ${state.author === value ? "selected" : ""}>${esc(value)}</option>`).join("")}</select></div>
-        <div class="filter-group"><label for="filterPublisher">دار النشر</label><select class="select" id="filterPublisher"><option value="all">كل دور النشر</option>${listValues("publisher").map((value) => `<option ${state.publisher === value ? "selected" : ""}>${esc(value)}</option>`).join("")}</select></div></aside>
-        <div class="books-panel"><div class="library-tools"><label class="search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="bookSearch" value="${esc(state.query)}" placeholder="ابحث في الكتب"></label><select class="sort" id="sortBooks"><option value="recent">آخر تحديث</option><option value="title" ${state.sort === "title" ? "selected" : ""}>العنوان</option><option value="author" ${state.sort === "author" ? "selected" : ""}>المؤلف</option></select></div>
-          <div class="table-card"><table><thead><tr><th>الكتاب</th><th>المؤلف</th><th>المحقق</th><th>دار النشر</th><th>بيانات النشر</th><th>الموضوع</th><th>الحالة</th><th></th></tr></thead><tbody>${rows.length ? rows.map(bookRow).join("") : `<tr><td class="empty" colspan="8">${state.books.length ? "لا توجد كتب مطابقة" : "المكتبة فارغة. أضف ملف PDF أو اختر مجلدًا للبدء."}</td></tr>`}</tbody></table></div>
+      <div class="page-head"><div><h1>الكتب</h1><p>${state.books.length} كتابًا في المكتبة المحلية</p></div><div class="actions"><button class="btn selection-btn" id="moveBooks" ${state.selectedBooks.size ? "" : "disabled"}>نقل إلى موضوع${state.selectedBooks.size ? ` (${state.selectedBooks.size})` : ""}</button><button class="btn export-btn" id="exportBooks" ${state.selectedBooks.size ? "" : "disabled"}>تصدير المحدد إلى Word${state.selectedBooks.size ? ` (${state.selectedBooks.size})` : ""}</button><button class="btn" data-action="add-file">إضافة ملف PDF</button><button class="btn" data-action="manual">إضافة كتاب يدويًا</button><button class="btn btn-primary" data-action="folder">فحص مجلد</button></div></div>
+      <div class="library-layout"><div class="books-panel"><div class="library-tools"><div class="search-tools"><label class="search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="bookSearch" value="${esc(state.query)}" placeholder="ابحث في الكتب"></label><select class="search-mode-select" id="bookSearchMode" aria-label="طريقة البحث" title="اختر بين البحث بالكلمات والصيغ القريبة أو مطابقة العبارة">${searchModeOptions(state.searchMode)}</select></div><button class="btn filter-toggle ${filterCount ? "active" : ""}" id="toggleFilters" type="button" aria-expanded="${state.filtersOpen}" aria-controls="bookFilters"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 6h16M7 12h10m-7 6h4"/></svg><span>تصفية</span>${filterCount ? `<span class="filter-count">${filterCount}</span>` : ""}<span class="filter-chevron" aria-hidden="true">⌄</span></button><select class="sort" id="sortBooks" aria-label="ترتيب الكتب"><option value="relevance" ${state.sort === "relevance" ? "selected" : ""}>الأكثر صلة</option><option value="recent" ${state.sort === "recent" ? "selected" : ""}>آخر تحديث</option><option value="title" ${state.sort === "title" ? "selected" : ""}>العنوان</option><option value="author" ${state.sort === "author" ? "selected" : ""}>المؤلف</option></select></div>
+          <section class="filter-menu" id="bookFilters" aria-label="خيارات تصفية الكتب" ${state.filtersOpen ? "" : "hidden"}>
+            <div class="filter-group"><label>الحالة</label><div class="status-filters">${[["complete", "مكتمل"], ["review", "يحتاج مراجعة"], ["failed", "تعذر الفحص"]].map(([value, label]) => `<label class="check"><input type="checkbox" data-status="${value}" ${state.statuses.has(value) ? "checked" : ""}><span>${label}</span><em>${state.books.filter((book) => statusClass(book.status) === value).length}</em></label>`).join("")}</div></div>
+            <div class="filter-group"><label for="filterTopic">الموضوع</label><select class="select" id="filterTopic"><option value="all">كل الموضوعات</option>${listValues("topic").map((value) => `<option ${state.topic === value ? "selected" : ""}>${esc(value)}</option>`).join("")}</select></div>
+            <div class="filter-group"><label for="filterAuthor">المؤلف</label><select class="select" id="filterAuthor"><option value="all">كل المؤلفين</option>${listValues("author").map((value) => `<option ${state.author === value ? "selected" : ""}>${esc(value)}</option>`).join("")}</select></div>
+            <div class="filter-group"><label for="filterPublisher">دار النشر</label><select class="select" id="filterPublisher"><option value="all">كل دور النشر</option>${listValues("publisher").map((value) => `<option ${state.publisher === value ? "selected" : ""}>${esc(value)}</option>`).join("")}</select></div>
+            <button class="btn filter-clear" data-action="clear-filters" type="button" ${filterCount ? "" : "disabled"}>مسح التصفية</button>
+          </section>
+          <div class="table-card"><table><thead><tr><th><label><input class="book-select-all" id="selectPageBooks" type="checkbox" ${pageSelected ? "checked" : ""} ${rows.length ? "" : "disabled"} aria-label="تحديد الكتب الظاهرة"> الكتاب</label></th><th>المؤلف</th><th>المحقق</th><th>دار النشر</th><th>بيانات النشر</th><th>الموضوع</th><th>الحالة</th><th></th></tr></thead><tbody>${rows.length ? rows.map((book) => bookRow(book, true)).join("") : `<tr><td class="empty" colspan="8">${state.books.length ? "لا توجد كتب مطابقة" : "المكتبة فارغة. أضف ملف PDF أو اختر مجلدًا للبدء."}</td></tr>`}</tbody></table></div>
           <div class="pagination"><span>عرض ${all.length ? ((state.page - 1) * state.pageSize) + 1 : 0} إلى ${Math.min(state.page * state.pageSize, all.length)} من ${all.length}</span><div class="pages"><button class="page-btn" data-page="prev" ${state.page === 1 ? "disabled" : ""}>‹</button>${Array.from({ length: pages }, (_, index) => `<button class="page-btn ${state.page === index + 1 ? "active" : ""}" data-page="${index + 1}">${index + 1}</button>`).join("")}<button class="page-btn" data-page="next" ${state.page === pages ? "disabled" : ""}>›</button></div></div>
         </div></div>`;
     bindBooks();
@@ -253,7 +412,13 @@
   }
 
   function bindBooks() {
+    $("#toggleFilters").onclick = () => {
+      state.filtersOpen = !state.filtersOpen;
+      $("#bookFilters").hidden = !state.filtersOpen;
+      $("#toggleFilters").setAttribute("aria-expanded", String(state.filtersOpen));
+    };
     $("#bookSearch").oninput = (event) => { state.query = event.target.value; state.page = 1; renderBooks(); };
+    $("#bookSearchMode").onchange = (event) => { updateSearchMode(event.target.value); state.page = 1; renderBooks(); };
     $("#sortBooks").onchange = (event) => { state.sort = event.target.value; renderBooks(); };
     $("#filterTopic").onchange = (event) => { state.topic = event.target.value; state.page = 1; renderBooks(); };
     $("#filterAuthor").onchange = (event) => { state.author = event.target.value; state.page = 1; renderBooks(); };
@@ -263,6 +428,22 @@
       state.page = 1;
       renderBooks();
     });
+    $("#selectPageBooks").onchange = (event) => {
+      const pageBooks = filteredBooks().slice((state.page - 1) * state.pageSize, state.page * state.pageSize);
+      pageBooks.forEach((book) => event.target.checked
+        ? state.selectedBooks.add(book.id)
+        : state.selectedBooks.delete(book.id));
+      renderBooks();
+    };
+    $$("[data-select-book]").forEach((control) => {
+      control.onclick = (event) => event.stopPropagation();
+      control.onchange = () => {
+        control.checked ? state.selectedBooks.add(control.dataset.selectBook) : state.selectedBooks.delete(control.dataset.selectBook);
+        renderBooks();
+      };
+    });
+    $("#moveBooks").onclick = () => openMoveBooks([...state.selectedBooks]);
+    $("#exportBooks").onclick = exportSelectedBooks;
     $$("[data-book-id]").forEach((row) => row.onclick = () => go(`book/${row.dataset.bookId}`));
     $$("[data-row-menu]").forEach((button) => button.onclick = (event) => {
       event.stopPropagation();
@@ -278,12 +459,19 @@
   }
 
   function scanActivityLabel(page, maxPages) {
-    const position = (page - 1) / Math.max(1, maxPages);
-    if (position < 0.2) return `أقرأ الصفحة ${page} وأتحقق من عنوان الكتاب`;
-    if (position < 0.4) return `أقرأ الصفحة ${page} وأتعرف على اسم المؤلف`;
-    if (position < 0.6) return `أقرأ الصفحة ${page} وأبحث عن المحقق`;
-    if (position < 0.8) return `أقرأ الصفحة ${page} وأستخرج بيانات النشر`;
-    return `أقرأ الصفحة ${page} وأراجع الطبعة والمجلد والموضوع`;
+    if (page < maxPages) return `أجهّز الصفحة ${page} من ${maxPages} للطلب الموحّد`;
+    const pageLabel = maxPages === 1 ? "صفحة واحدة" : `${maxPages} صفحات`;
+    return `أحلل ${pageLabel} في طلب Gemini واحد`;
+  }
+
+  function formatWait(seconds) {
+    if (seconds >= 3600) {
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.ceil((seconds % 3600) / 60);
+      return minutes ? `${hours} ساعة و${minutes} دقيقة` : `${hours} ساعة`;
+    }
+    if (seconds >= 60) return `${Math.ceil(seconds / 60)} دقيقة`;
+    return `${seconds} ثانية`;
   }
 
   function renderScan() {
@@ -294,17 +482,23 @@
     const targetPages = item ? Math.min(scan.maxPages, state.books.find((book) => book.id === item.book_id)?.pageCount || scan.maxPages) : 1;
     const bookPercent = item ? Math.min(100, Math.round(scan.currentPage / Math.max(targetPages, 1) * 100)) : 0;
     const overallPercent = scan?.items?.length ? Math.min(100, Math.round((finished + (item ? bookPercent / 100 : 0)) / scan.items.length * 100)) : 0;
-    const heading = running ? (scan.paused ? "الفحص متوقف مؤقتًا" : "الكتاب الحالي")
+    const bufferSeconds = running ? Math.max(0, Math.ceil(((scan.bufferUntil || 0) - Date.now()) / 1000)) : 0;
+    const buffering = Boolean(bufferSeconds && !scan.paused);
+    const quota = state.models.find((model) => model.value === scan?.model);
+    const bufferMessage = scan?.rateLimitWindow === "day"
+      ? `بلغ الفحص الحد اليومي، ${scan.rateLimitRpd || quota?.dailyRequests || 0} طلبًا. سيستأنف تلقائيًا بعد خروج أقدم طلب من نافذة 24 ساعة.`
+      : `بلغ الفحص حد الأمان، ${scan?.rateLimitRpm || quota?.safeRequestsPerMinute || 1} من أصل ${quota?.requestsPerMinute || "الحد المنشور"} طلبات في الدقيقة. سيستأنف تلقائيًا عند توفر طلب جديد.`;
+    const heading = running ? (scan.paused ? "الفحص متوقف مؤقتًا" : buffering ? "انتظار حصة API" : "الكتاب الحالي")
       : scan?.state === "cancelled" ? "أُوقف الفحص"
         : scan?.state === "failed" ? "تعذر إكمال الفحص"
           : scan?.items?.length ? "اكتمل الفحص" : "لا يوجد فحص جارٍ";
     $("#routeHost").innerHTML = `
       <div class="page-head"><div><h1>الفحص</h1><p>${esc(state.libraryLabel)}</p></div><div class="actions"><button class="btn" data-action="add-file">إضافة ملف PDF</button><button class="btn btn-primary" data-action="folder">فحص مجلد</button></div></div>
       <div class="scan-grid"><section class="card"><div class="card-head"><h2>${heading}</h2><small>${finished} مكتمل من ${scan?.items?.length || 0}</small></div><div class="current-scan">${item ? `
-        <div class="scan-file"><div class="pdf-icon">PDF</div><div><strong>${esc(item.file)}</strong><small>الكتاب ${scan.currentIndex + 1} من ${scan.items.length}، الصفحة ${scan.currentPage || 1}، والحد الأقصى ${scan.maxPages}</small></div></div>
-        <div class="scan-activity ${scan.paused ? "paused" : ""}" role="status" aria-live="polite"><span class="activity-dot" aria-hidden="true"></span><div><small>ما يجري الآن</small><strong>${scan.paused ? `توقفت عند الصفحة ${scan.currentPage}` : scanActivityLabel(scan.currentPage || 1, targetPages)}</strong><p>${scan.paused ? "لن ينتقل الفحص إلى صفحة أخرى حتى تضغط على استكمال." : "أحلل النص الظاهر وأحدّث الحقول أدناه عند العثور على بيانات."}</p></div></div>
+        <div class="scan-file"><div class="pdf-icon">PDF</div><div><strong>${esc(item.file)}</strong><small>الكتاب ${scan.currentIndex + 1} من ${scan.items.length}، تجهيز الصفحة ${scan.currentPage || 1} من ${targetPages}</small></div></div>
+        <div class="scan-activity ${scan.paused ? "paused" : buffering ? "buffering" : ""}" role="status" aria-live="polite"><span class="activity-dot" aria-hidden="true"></span><div><small>ما يجري الآن</small><strong>${scan.paused ? `توقفت عند الصفحة ${scan.currentPage}` : buffering ? `استكمال الفحص بعد ${formatWait(bufferSeconds)}` : scanActivityLabel(scan.currentPage || 1, targetPages)}</strong><p>${scan.paused ? "لن ينتقل الفحص إلى صفحة أخرى حتى تضغط على استكمال." : buffering ? bufferMessage : "تُرسل الصفحات كصور مستقلة مرتبة داخل طلب واحد لهذا الكتاب."}</p></div></div>
         <div class="scan-progresses"><div class="progress-block"><div class="progress-meta"><span>تقدم الكتاب الحالي</span><strong>${bookPercent}%</strong></div><div class="progress"><span style="width:${bookPercent}%"></span></div></div><div class="progress-block"><div class="progress-meta"><span>تقدم الطابور كله</span><strong>${overallPercent}%</strong></div><div class="progress"><span style="width:${overallPercent}%"></span></div></div></div>
-        <div class="extracted">${fields.map(([key, label]) => `<div class="${item[key] ? "" : "active"}"><span>${label}</span><strong class="${item[key] ? "" : "waiting"}">${esc(item[key] || (scan.paused ? "متوقف مؤقتًا" : "جارٍ البحث"))}</strong></div>`).join("")}</div>
+        <div class="extracted">${fields.map(([key, label]) => `<div class="${item[key] ? "" : "active"}"><span>${label}</span><strong class="${item[key] ? "" : "waiting"}">${esc(item[key] || (scan.paused ? "متوقف مؤقتًا" : buffering ? "بانتظار حصة API" : "جارٍ البحث"))}</strong></div>`).join("")}</div>
         <div class="scan-controls"><button class="btn btn-primary" id="pauseScan">${scan.paused ? "استكمال الفحص" : "إيقاف مؤقت"}</button><button class="btn" id="skipScan">تخطي هذا الكتاب</button><button class="btn btn-danger" id="cancelScan">إنهاء الفحص</button></div>` : `
         <div class="empty scan-empty"><strong>${heading}</strong><span>${scan?.error ? esc(scan.error) : "اختر ملف PDF أو مجلدًا لبدء استخراج بيانات الكتب."}</span><button class="btn btn-primary" data-action="folder">اختيار مجلد</button></div>`}</div></section>
         <aside class="card"><div class="card-head"><h2>طابور الفحص</h2><div class="card-head-tools"><small>${scan?.items?.length || 0} كتب</small>${scan?.items?.length ? '<button class="link-btn open-all-books" id="openAllScanBooks" type="button">فتح الكل</button>' : ""}</div></div><div class="queue-list">${scan?.items?.length ? scan.items.map((entry, index) => { const current = running && index === scan.currentIndex; const bookName = entry.title || entry.file || "كتاب بلا عنوان"; return `<div class="queue-row ${current ? "current" : ""}"><span class="queue-num">${index + 1}</span><div class="queue-book"><a class="queue-book-link" href="${bookRouteHref(entry.book_id)}" aria-label="فتح صفحة الكتاب: ${esc(bookName)}" title="افتح الصفحة، أو استخدم زر الفأرة الأوسط لفتحها في تبويب جديد">${esc(bookName)}</a>${entry.title && entry.file && entry.title !== entry.file ? `<small class="queue-file">${esc(entry.file)}</small>` : ""}<small>${current && scan.paused ? "متوقف مؤقتًا" : statusLabel(current ? "current" : entry.state)}</small>${entry.error ? `<small class="missing">${esc(entry.error)}</small>` : ""}</div><span class="queue-state ${statusClass(current ? "current" : entry.state)}"></span></div>`; }).join("") : "<div class=\"empty\">الطابور فارغ</div>"}</div></aside></div>`;
@@ -346,10 +540,18 @@
     if (!book) { go("books"); return; }
     const history = book.history || [];
     $("#routeHost").innerHTML = `
-      <div class="detail-head"><button class="btn btn-icon back" id="backBooks">←</button><div><h1>${esc(book.title)}</h1><p>${esc(book.file)}</p></div><span class="status ${statusClass(book.status)}">${statusLabel(book.status)}</span><div class="actions"><button class="btn" id="openPdf" ${book.pageCount ? "" : "disabled"}>فتح ملف PDF</button><button class="btn" id="editBook">تعديل البيانات</button><button class="btn btn-primary" id="rescanBook" ${book.pageCount ? "" : "disabled"}>إعادة توليد البيانات</button></div></div>
-      <div class="detail-layout"><div><section class="card metadata"><div class="metadata-grid">${fields.map(([key, label]) => `<div class="meta-row"><span>${label}</span>${detailMetadataValue(book, key, label)}</div>`).join("")}<div class="meta-row"><span>الثقة</span><strong>${book.confidence}%</strong></div><div class="meta-row"><span>الصفحات المفحوصة</span><strong>${book.pagesChecked} من ${book.maxPages}</strong></div></div><div class="path-box">${esc(book.path)}</div>${book.error ? `<div class="impact missing">${esc(book.error)}</div>` : ""}</section><section class="card history"><div class="card-head"><h2>سجل الكتاب</h2></div><div style="padding:0 14px">${history.length ? history.map((entry) => `<div class="history-row"><time>${esc(formatDate(entry.date))}</time><span>${esc(entry.text)}</span><small>المحاولة ${entry.attempt || book.attempts}</small></div>`).join("") : '<div class="empty">لا توجد أحداث مسجلة</div>'}</div></section></div><aside class="card pdf-preview"><div class="pdf-page"><span>صفحة العنوان</span><strong>${esc(book.title)}</strong><span>${esc(book.author || "المؤلف غير معروف")}</span></div></aside></div>`;
+      <div class="detail-head"><button class="btn btn-icon back" id="backBooks">←</button><div><h1>${esc(book.title)}</h1><p>${esc(book.file)}</p></div><span class="status ${statusClass(book.status)}">${statusLabel(book.status)}</span><div class="actions"><button class="btn" id="openPdf" ${book.pageCount ? "" : "disabled"}>فتح ملف PDF</button><button class="btn" id="openBookFolder" ${book.fullPath ? "" : "disabled"}>فتح المجلد</button><button class="btn" id="moveBookTopic">نقل إلى موضوع</button><button class="btn" id="editBook">تعديل البيانات</button><button class="btn btn-primary" id="rescanBook" ${book.pageCount ? "" : "disabled"}>إعادة توليد البيانات</button></div></div>
+      <div class="detail-layout"><div><section class="card metadata"><div class="metadata-grid">${fields.map(([key, label]) => `<div class="meta-row"><span>${label}</span>${detailMetadataValue(book, key, label)}</div>`).join("")}<div class="meta-row"><span>الثقة</span><strong>${book.confidence}%</strong></div><div class="meta-row"><span>الصفحات المفحوصة</span><strong>${book.pagesChecked} من ${book.maxPages}</strong></div></div><div class="path-box"><strong>المسار الكامل على الجهاز</strong><br>${esc(book.fullPath || "لا يوجد ملف مرتبط بهذا الكتاب")}</div>${book.error ? `<div class="impact missing">${esc(book.error)}</div>` : ""}</section><section class="card history"><div class="card-head"><h2>سجل الكتاب</h2></div><div style="padding:0 14px">${history.length ? history.map((entry) => `<div class="history-row"><time>${esc(formatDate(entry.date))}</time><span>${esc(entry.text)}</span><small>المحاولة ${entry.attempt || book.attempts}</small></div>`).join("") : '<div class="empty">لا توجد أحداث مسجلة</div>'}</div></section></div><aside class="card pdf-preview"><div class="pdf-page"><span>صفحة العنوان</span><strong>${esc(book.title)}</strong><span>${esc(book.author || "المؤلف غير معروف")}</span></div></aside></div>`;
     $("#backBooks").onclick = () => go("books");
     $("#openPdf").onclick = () => window.open(`/api/books/${book.id}/pdf`, "_blank", "noopener");
+    $("#openBookFolder").onclick = async () => {
+      try {
+        await api(`/api/books/${book.id}/folder`, { method: "POST" });
+      } catch (error) {
+        toast("تعذر فتح المجلد", error.message, "error");
+      }
+    };
+    $("#moveBookTopic").onclick = () => openMoveBooks([book.id]);
     $("#editBook").onclick = () => openEdit(book.id);
     $("#rescanBook").onclick = () => openRescan(book.id);
   }
@@ -364,9 +566,16 @@
       if (!map.has(name)) map.set(name, []);
       map.get(name).push(book);
     });
-    return [...map.entries()].map(([name, books]) => ({ name, books }))
-      .filter((row) => !state.entityQuery || row.name.toLowerCase().includes(state.entityQuery.toLowerCase()))
-      .sort((a, b) => a.name.localeCompare(b.name, "ar"));
+    return [...map.entries()].map(([name, books], index) => ({
+      name,
+      books,
+      index,
+      score: searchScore(state.entityQuery, [{ value: name, weight: 1 }], state.searchMode),
+    }))
+      .filter((row) => row.score > 0)
+      .sort((a, b) => state.entityQuery.trim()
+        ? b.score - a.score || a.index - b.index
+        : a.name.localeCompare(b.name, "ar"));
   }
 
   function renderEntities() {
@@ -379,8 +588,8 @@
     const rows = allRows.slice((state.entityPage - 1) * state.entityPageSize, state.entityPage * state.entityPageSize);
     const allSelected = rows.length && rows.every((row) => state.selectedEntities.has(row.name));
     $("#routeHost").innerHTML = `
-      <div class="page-head"><div><h1>${config.title}</h1><p>${allRows.length} اسمًا مرتبة أبجديًا</p></div></div>
-      <div class="bulkbar"><label class="select-all"><input id="selectAllEntities" type="checkbox" ${allSelected ? "checked" : ""} aria-label="تحديد الصفحة"></label><label class="search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="entitySearch" value="${esc(state.entityQuery)}" placeholder="ابحث في ${config.title}"></label><select class="select" id="entityAction"><option value="">اختر إجراء</option><option value="merge" ${state.entityAction === "merge" ? "selected" : ""}>دمج المحدد</option><option value="rename" ${state.entityAction === "rename" ? "selected" : ""}>إعادة تسمية</option><option value="delete" ${state.entityAction === "delete" ? "selected" : ""}>حذف</option></select><button class="btn btn-primary" id="applyEntityAction" ${state.selectedEntities.size ? "" : "disabled"}>تنفيذ</button><span class="selected-count">${state.selectedEntities.size ? `${state.selectedEntities.size} محدد` : "لم تحدد شيئًا"}</span></div>
+      <div class="page-head"><div><h1>${config.title}</h1><p>${allRows.length} اسمًا ${state.entityQuery.trim() ? "مرتبة حسب الصلة" : "مرتبة أبجديًا"}</p></div></div>
+      <div class="bulkbar"><label class="select-all"><input id="selectAllEntities" type="checkbox" ${allSelected ? "checked" : ""} aria-label="تحديد الصفحة"></label><div class="search-tools"><label class="search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="entitySearch" value="${esc(state.entityQuery)}" placeholder="ابحث في ${config.title}"></label><select class="search-mode-select" id="entitySearchMode" aria-label="طريقة البحث" title="اختر بين البحث بالكلمات والصيغ القريبة أو مطابقة العبارة">${searchModeOptions(state.searchMode)}</select></div><select class="select" id="entityAction"><option value="">اختر إجراء</option><option value="merge" ${state.entityAction === "merge" ? "selected" : ""}>دمج المحدد</option><option value="rename" ${state.entityAction === "rename" ? "selected" : ""}>إعادة تسمية</option><option value="delete" ${state.entityAction === "delete" ? "selected" : ""}>حذف</option></select><button class="btn btn-primary" id="applyEntityAction" ${state.selectedEntities.size ? "" : "disabled"}>تنفيذ</button><span class="selected-count">${state.selectedEntities.size ? `${state.selectedEntities.size} محدد` : "لم تحدد شيئًا"}</span></div>
       <div class="table-card"><table><thead><tr><th style="width:38px"></th><th>${config.singular}</th><th>عدد الكتب</th><th>كتب مرتبطة</th><th></th></tr></thead><tbody>${rows.length ? rows.map((row) => { const encoded = encodeURIComponent(row.name); return `<tr><td><input class="entity-check" type="checkbox" data-entity="${encoded}" ${state.selectedEntities.has(row.name) ? "checked" : ""}></td><td><button class="link-btn entity-name" data-view-entity="${encoded}">${esc(row.name)}</button></td><td>${row.books.length}</td><td class="book-examples">${esc(row.books.slice(0, 3).map((book) => book.title).join("، "))}${row.books.length > 3 ? "…" : ""}</td><td><button class="link-btn" data-view-entity="${encoded}">فتح الصفحة</button></td></tr>`; }).join("") : '<tr><td class="empty" colspan="5">لا توجد نتائج مطابقة</td></tr>'}</tbody></table></div>
       <div class="pagination"><span>عرض ${allRows.length ? ((state.entityPage - 1) * state.entityPageSize) + 1 : 0} إلى ${Math.min(state.entityPage * state.entityPageSize, allRows.length)} من ${allRows.length}</span><div class="pages"><button class="page-btn" data-entity-page="prev" ${state.entityPage === 1 ? "disabled" : ""}>‹</button>${Array.from({ length: pages }, (_, index) => `<button class="page-btn ${state.entityPage === index + 1 ? "active" : ""}" data-entity-page="${index + 1}">${index + 1}</button>`).join("")}<button class="page-btn" data-entity-page="next" ${state.entityPage === pages ? "disabled" : ""}>›</button></div></div>`;
     bindEntities(rows);
@@ -393,6 +602,7 @@
 
   function bindEntities(pageRows) {
     $("#entitySearch").oninput = (event) => { state.entityQuery = event.target.value; state.entityPage = 1; state.selectedEntities.clear(); renderEntities(); };
+    $("#entitySearchMode").onchange = (event) => { updateSearchMode(event.target.value); state.entityPage = 1; state.selectedEntities.clear(); renderEntities(); };
     $("#entityAction").onchange = (event) => { state.entityAction = event.target.value; };
     $("#selectAllEntities").onchange = (event) => {
       const names = pageRows.map((row) => row.name);
@@ -429,13 +639,13 @@
   }
 
   function renderSettings() {
-    const modelOptions = geminiModels.map((model) => {
+    const modelOptions = state.models.map((model) => {
       const selected = model.value === state.settings.model ? " selected" : "";
-      return `<option value="${model.value}"${selected}>${model.label} (${model.dailyRequests} طلب يوميًا)</option>`;
+      return `<option value="${model.value}"${selected}>${model.label} (حد المزوّد ${model.requestsPerMinute}/دقيقة، التطبيق ${model.safeRequestsPerMinute}/دقيقة، ${model.dailyRequests}/يوم)</option>`;
     }).join("");
     $("#routeHost").innerHTML = `
       <div class="page-head"><div><h1>الإعدادات</h1><p>مفتاح Gemini والنموذج والتعليمات المستخدمة في فحص الكتب</p></div><div class="actions"><button class="btn btn-primary" id="saveSettings">حفظ الإعدادات</button></div></div>
-      <div class="settings-layout"><section class="card settings-card"><h2>Gemini API</h2><p>يحفظ التطبيق المفتاح داخل قاعدة SQLite المحلية على هذا الكمبيوتر.</p><div class="form-field"><label for="apiKeyInput">API Key</label><div class="secret-field"><input class="input" id="apiKeyInput" type="password" autocomplete="new-password" placeholder="${state.settings.keySaved ? "المفتاح محفوظ. اتركه فارغًا للاحتفاظ به" : "أدخل المفتاح"}"><button class="btn btn-icon" id="toggleApiKey" type="button" aria-label="إظهار المفتاح"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div><div class="form-field" style="margin-top:14px"><label for="modelInput">نموذج Gemini</label><select class="input" id="modelInput" dir="ltr" aria-describedby="modelInputHint">${modelOptions}</select><div class="hint" id="modelInputHint">العدد بين القوسين هو الحد المجاني للطلبات يوميًا.</div></div><div class="key-status ${state.settings.keySaved ? "saved" : ""}">${state.settings.keySaved ? "المفتاح محفوظ في قاعدة البيانات" : "لم يُحفظ مفتاح بعد"}</div></section>
+      <div class="settings-layout"><section class="card settings-card"><h2>Gemini API</h2><p>يحفظ التطبيق المفتاح داخل قاعدة SQLite المحلية على هذا الكمبيوتر.</p><div class="form-field"><label for="apiKeyInput">API Key</label><div class="secret-field"><input class="input" id="apiKeyInput" type="password" autocomplete="new-password" placeholder="${state.settings.keySaved ? "المفتاح محفوظ. اتركه فارغًا للاحتفاظ به" : "أدخل المفتاح"}"><button class="btn btn-icon" id="toggleApiKey" type="button" aria-label="إظهار المفتاح"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div><div class="form-field" style="margin-top:14px"><label for="modelInput">نموذج Gemini</label><select class="input" id="modelInput" dir="ltr" aria-describedby="modelInputHint">${modelOptions}</select><div class="hint" id="modelInputHint">يترك التطبيق طلبًا واحدًا احتياطيًا تحت حد الدقيقة، ويحسب كل طلب صفحة داخل نافذتين متحركتين مدتهما 60 ثانية و24 ساعة.</div></div><div class="key-status ${state.settings.keySaved ? "saved" : ""}">${state.settings.keySaved ? "المفتاح محفوظ في قاعدة البيانات" : "لم يُحفظ مفتاح بعد"}</div></section>
       <section class="card prompt-card"><div class="prompt-head"><h2>Prompt استخراج بيانات الكتاب</h2><button class="btn btn-small" id="resetPrompt">استعادة النص الافتراضي</button></div><div class="prompt-body"><div class="variables"><span>إدراج متغير</span>${["{{file_name}}", "{{page_number}}", "{{max_pages}}", "{{previous_results}}", "{{missing_fields}}"].map((token) => `<button class="variable-btn" data-token="${token}">${token}</button>`).join("")}</div><textarea class="prompt-editor" id="promptInput" spellcheck="false">${esc(state.settings.prompt)}</textarea><div class="prompt-foot"><span>تُستبدل المتغيرات قبل الطلب. مخطط JSON ثابت داخل الخادم ولا يظهر هنا.</span><span id="promptCount">${state.settings.prompt.length} حرف</span></div></div></section></div>`;
     bindSettings();
   }
@@ -537,12 +747,82 @@
     }
   }
 
+  function openMoveBooks(bookIds) {
+    const books = [...new Set(bookIds)]
+      .map((id) => state.books.find((book) => book.id === id))
+      .filter(Boolean);
+    if (!books.length) return;
+    state.movingBookIds = books.map((book) => book.id);
+    $("#moveBooksTitle").textContent = books.length === 1 ? "نقل الكتاب إلى موضوع" : "نقل الكتب إلى موضوع";
+    $("#moveTopicInput").value = "";
+    $("#moveTopicOptions").innerHTML = listValues("topic")
+      .map((topic) => `<option value="${esc(topic)}"></option>`)
+      .join("");
+    const currentTopics = [...new Set(books.map((book) => book.topic).filter(Boolean))];
+    $("#moveBooksImpact").textContent = books.length === 1
+      ? `سيُنقل «${books[0].title}» من ${currentTopics[0] || "دون موضوع"}.`
+      : `سيُنقل ${books.length} من الكتب${currentTopics.length ? ` من ${currentTopics.length} موضوع` : " التي لا موضوع لها"}.`;
+    openModal("moveBooksModal");
+    $("#moveTopicInput").focus();
+  }
+
+  async function saveBookMove() {
+    const topic = $("#moveTopicInput").value.trim();
+    if (!topic) return toast("الموضوع مطلوب", "اختر موضوعًا موجودًا أو اكتب موضوعًا جديدًا", "error");
+    try {
+      const result = await api("/api/books/move", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ book_ids: state.movingBookIds, topic }),
+      });
+      state.movingBookIds.forEach((id) => state.selectedBooks.delete(id));
+      closeModal("moveBooksModal");
+      await refreshData();
+      toast(
+        result.affected ? "تم نقل الكتب" : "لا يوجد تغيير",
+        result.affected ? `${result.affected} كتاب إلى موضوع ${topic}` : `الكتب موجودة بالفعل في موضوع ${topic}`,
+      );
+    } catch (error) {
+      toast("تعذر نقل الكتب", error.message, "error");
+    }
+  }
+
+  async function exportSelectedBooks() {
+    const bookIds = [...state.selectedBooks];
+    if (!bookIds.length) return;
+    const button = $("#exportBooks");
+    button.disabled = true;
+    button.textContent = "أُجهز ملف Word";
+    try {
+      const response = await fetch("/api/books/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ book_ids: bookIds }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.detail || `تعذر التصدير (${response.status})`);
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "فهرس-الكتب.docx";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      toast("اكتمل التصدير", `يتضمن ملف Word عدد ${bookIds.length} من الكتب`);
+    } catch (error) {
+      toast("تعذر تصدير الكتب", error.message, "error");
+    } finally {
+      renderBooks();
+    }
+  }
+
   function handleAction(action) {
     if (action === "folder") openFolder();
-    if (action === "add-file") $("#singleFileInput").click();
+    if (action === "add-file") chooseSingleFile();
     if (action === "manual") openManual();
-    if (action === "clear") {
-      state.query = "";
+    if (action === "clear-filters") {
       state.statuses.clear();
       state.topic = state.author = state.publisher = "all";
       state.page = 1;
@@ -554,16 +834,67 @@
   function closeModal(id) { $(`#${id}`).classList.remove("open"); }
   function openFolder() {
     pendingFolder = "";
-    pendingFiles = [];
+    pendingFileCount = 0;
+    folderPreviewSequence += 1;
     $("#pendingFolderPath").textContent = "لم يُحدد مجلد";
+    $("#folderSelectionSummary").textContent = "اختر مجلدًا لعرض عدد الملفات التي ستُفحص.";
     $("#startFolderScanBtn").disabled = true;
     openModal("folderModal");
   }
-  function chooseFolder(path, files) {
+  async function chooseFolder(path) {
     pendingFolder = path;
-    pendingFiles = files;
     $("#pendingFolderPath").textContent = path;
-    $("#startFolderScanBtn").disabled = !files.length;
+    await updateFolderSelection();
+  }
+  function folderOptions() {
+    const includeSubfolders = $("#includeSubfolders").checked;
+    return {
+      includeSubfolders,
+      maxDepth: includeSubfolders ? Number($("#folderMaxDepth").value) : 0,
+      perFolderLimit: Number($("#folderPdfLimit").value),
+    };
+  }
+  function folderPayload() {
+    const options = folderOptions();
+    return {
+      path: pendingFolder,
+      include_subfolders: options.includeSubfolders,
+      max_depth: options.includeSubfolders ? options.maxDepth : 1,
+      per_folder_limit: options.perFolderLimit,
+    };
+  }
+  async function updateFolderSelection() {
+    const previewSequence = ++folderPreviewSequence;
+    $("#folderMaxDepth").disabled = !$("#includeSubfolders").checked;
+    const options = folderOptions();
+    const validDepth = !options.includeSubfolders || (Number.isInteger(options.maxDepth) && options.maxDepth >= 1 && options.maxDepth <= 50);
+    const validLimit = Number.isInteger(options.perFolderLimit) && options.perFolderLimit >= 1 && options.perFolderLimit <= 100;
+    pendingFileCount = 0;
+    $("#startFolderScanBtn").disabled = true;
+    if (!pendingFolder) return;
+    if (!validDepth || !validLimit) {
+      $("#folderSelectionSummary").textContent = "راجع عمق المجلدات والحد الأقصى للملفات.";
+      return;
+    }
+    $("#folderSelectionSummary").textContent = "جارٍ فحص محتويات المجلد...";
+    try {
+      const preview = await api("/api/imports/folder/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(folderPayload()),
+      });
+      if (previewSequence !== folderPreviewSequence) return;
+      pendingFolder = preview.path;
+      pendingFileCount = preview.count;
+      $("#pendingFolderPath").textContent = preview.path;
+      $("#startFolderScanBtn").disabled = !pendingFileCount;
+      $("#folderSelectionSummary").textContent = pendingFileCount
+        ? `سيُفحص ${pendingFileCount} ملف PDF داخل ${preview.folderCount} مجلد.`
+        : "لا توجد ملفات PDF مطابقة لهذه الخيارات.";
+    } catch (error) {
+      if (previewSequence !== folderPreviewSequence) return;
+      $("#folderSelectionSummary").textContent = error.message;
+    }
   }
   function readMaxPages(id) {
     const input = $(`#${id}`);
@@ -577,10 +908,22 @@
     input.removeAttribute("aria-invalid");
     return value;
   }
+  function readFolderNumber(id, min, max, message) {
+    const input = $(`#${id}`);
+    const value = Number(input.value);
+    if (!Number.isInteger(value) || value < min || value > max) {
+      input.setAttribute("aria-invalid", "true");
+      input.focus();
+      toast("القيمة غير صحيحة", message, "error");
+      return null;
+    }
+    input.removeAttribute("aria-invalid");
+    return value;
+  }
 
-  async function uploadAndScan(files, maxPages, folderLabel) {
+  async function importAndScan(importPath, payload, maxPages, folderLabel) {
     if (!state.settings.keySaved) {
-      toast("أدخل مفتاح Gemini أولًا", "احفظ المفتاح من صفحة الإعدادات ثم أعد اختيار الملفات", "error");
+      toast("أدخل مفتاح Gemini أولًا", "احفظ المفتاح من صفحة الإعدادات ثم أعد اختيار الكتب", "error");
       go("settings");
       return;
     }
@@ -589,39 +932,39 @@
       go("scan");
       return;
     }
-    state.uploading = true;
+    state.importing = true;
     go("scan");
-    $("#routeHost").innerHTML = `<div class="card"><div class="empty scan-empty"><strong>أرفع ملفات PDF</strong><span id="uploadProgress">0 من ${files.length}</span></div></div>`;
+    $("#routeHost").innerHTML = '<div class="card"><div class="empty scan-empty"><strong>جارٍ تجهيز الكتب</strong><span>تُستخدم الملفات من مساراتها الأصلية.</span></div></div>';
     try {
-      const bookIds = [];
-      for (let index = 0; index < files.length; index += 1) {
-        const file = files[index];
-        const relative = file.webkitRelativePath || file.name;
-        const book = await api("/api/uploads", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/pdf",
-            "X-File-Name": encodeURIComponent(file.name),
-            "X-Relative-Path": encodeURIComponent(relative),
-          },
-          body: file,
-        });
-        bookIds.push(book.id);
-        const progress = $("#uploadProgress");
-        if (progress) progress.textContent = `${index + 1} من ${files.length}: ${file.name}`;
-      }
+      const imported = await api(importPath, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const bookIds = imported.bookIds || [imported.id].filter(Boolean);
+      if (!bookIds.length) throw new Error("لا توجد ملفات PDF مطابقة لهذه الخيارات");
       state.libraryLabel = folderLabel || "المكتبة المحلية";
       await api("/api/scans", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ book_ids: bookIds, max_pages: maxPages }),
       });
       await refreshData();
-      toast("بدأ الفحص", `${files.length} كتاب في الطابور`);
+      toast("بدأ الفحص", `${bookIds.length} كتاب في الطابور`);
     } catch (error) {
       await refreshData();
       toast("تعذر بدء الفحص", error.message, "error");
     } finally {
-      state.uploading = false;
+      state.importing = false;
+    }
+  }
+
+  async function chooseSingleFile() {
+    try {
+      const selected = await api("/api/local-picker/file", { method: "POST" });
+      if (!selected.path) return;
+      await importAndScan("/api/imports/file", { path: selected.path }, 5, selected.path);
+    } catch (error) {
+      toast("تعذر اختيار الملف", error.message, "error");
     }
   }
 
@@ -668,26 +1011,31 @@
     $$("[data-route]").forEach((button) => button.onclick = () => go(button.dataset.route));
     $("#scanIndicator").onclick = () => go("scan");
     $("#sidebarFolder").onclick = openFolder;
-    $("#pickFolderBtn").onclick = () => $("#folderInput").click();
-    $("#recentFolderBtn").hidden = true;
-    $("#folderInput").onchange = (event) => {
-      const files = [...event.target.files].filter((file) => file.name.toLowerCase().endsWith(".pdf"));
-      if (!files.length) return toast("لا توجد ملفات PDF", "اختر مجلدًا آخر", "error");
-      const path = files[0].webkitRelativePath.split("/")[0] || "المجلد المختار";
-      chooseFolder(path, files);
+    $("#pickFolderBtn").onclick = async () => {
+      const button = $("#pickFolderBtn");
+      button.disabled = true;
+      try {
+        const selected = await api("/api/local-picker/folder", { method: "POST" });
+        if (selected.path) await chooseFolder(selected.path);
+      } catch (error) {
+        toast("تعذر اختيار المجلد", error.message, "error");
+      } finally {
+        button.disabled = false;
+      }
     };
-    $("#startFolderScanBtn").onclick = () => {
+    $("#recentFolderBtn").hidden = true;
+    $("#includeSubfolders").onchange = updateFolderSelection;
+    $("#folderMaxDepth").oninput = updateFolderSelection;
+    $("#folderPdfLimit").oninput = updateFolderSelection;
+    $("#startFolderScanBtn").onclick = async () => {
       const maxPages = readMaxPages("folderMaxPages");
       if (maxPages === null) return;
+      if ($("#includeSubfolders").checked && readFolderNumber("folderMaxDepth", 1, 50, "اكتب عمقًا صحيحًا من 1 إلى 50") === null) return;
+      if (readFolderNumber("folderPdfLimit", 1, 100, "اكتب عدد ملفات صحيحًا من 1 إلى 100") === null) return;
+      if (!pendingFileCount) return toast("لا توجد ملفات للفحص", "غيّر خيارات المجلد أو اختر مجلدًا آخر", "error");
+      const payload = folderPayload();
       closeModal("folderModal");
-      uploadAndScan(pendingFiles, maxPages, pendingFolder);
-      $("#folderInput").value = "";
-    };
-    $("#singleFileInput").onchange = (event) => {
-      const file = event.target.files[0];
-      if (!file) return;
-      uploadAndScan([file], 5, file.name);
-      event.target.value = "";
+      await importAndScan("/api/imports/folder", payload, maxPages, pendingFolder);
     };
     $("#saveManualBtn").onclick = async () => {
       const data = collect($("#manualFields"));
@@ -729,6 +1077,7 @@
       }
     };
     $("#saveEntityMergeBtn").onclick = saveEntityMerge;
+    $("#saveBookMoveBtn").onclick = saveBookMove;
     $$("[data-close]").forEach((button) => button.onclick = () => closeModal(button.dataset.close));
     $$(".modal-backdrop").forEach((modal) => modal.onclick = (event) => { if (event.target === modal) closeModal(modal.id); });
     window.addEventListener("hashchange", parseRoute);

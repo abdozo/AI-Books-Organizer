@@ -11,6 +11,8 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
+from organizer.runtime_revision import application_revision
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -58,11 +60,17 @@ def remove_stale_runtime() -> None:
 def start_server(open_browser: bool = True) -> int:
     current = read_runtime()
     if server_is_running(current):
-        url = server_url(current)
-        print(f"Server is already running at {url}")
-        if open_browser:
-            webbrowser.open(url)
-        return 0
+        revision = application_revision(PROJECT_ROOT)
+        if current.get("revision") == revision:
+            url = server_url(current)
+            print(f"Server is already running at {url}")
+            if open_browser:
+                webbrowser.open(url)
+            return 0
+        print("Application files changed. Restarting the server.")
+        result = stop_server()
+        if result:
+            return result
     remove_stale_runtime()
     root = data_root()
     root.mkdir(parents=True, exist_ok=True)

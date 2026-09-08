@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from pydantic import ValidationError
 
@@ -13,19 +13,21 @@ from .models import BOOK_REPLY_SCHEMA, SYSTEM_INSTRUCTION, BookExtraction
 
 
 MODEL_PATTERN = re.compile(r"gemini-[A-Za-z0-9._-]+")
+MAX_INLINE_IMAGE_BYTES = 12 * 1024 * 1024
 
 
 class GeminiFailure(RuntimeError):
     pass
 
 
-def inspect_pdf(data: bytes) -> int:
+def inspect_pdf(source: bytes | Path) -> int:
     try:
         import pypdfium2 as pdfium
     except ImportError as exc:
         raise RuntimeError("حزمة pypdfium2 غير مثبتة. ثبّت متطلبات التطبيق أولًا") from exc
     try:
-        with pdfium.PdfDocument(io.BytesIO(data)) as pdf:
+        document_source = io.BytesIO(source) if isinstance(source, bytes) else source
+        with pdfium.PdfDocument(document_source) as pdf:
             count = len(pdf)
     except Exception as exc:
         raise ValueError(f"تعذر فتح ملف PDF: {exc}") from exc
@@ -36,7 +38,49 @@ def inspect_pdf(data: bytes) -> int:
     return count
 
 
-def render_page(path: Path, page_number: int, dpi: int = 160) -> bytes:
+def _encode_jpeg_with_limit(image: Any, max_bytes: int) -> bytes:
+    """Keep one rendered page within its share of the inline request budget."""
+    from PIL import Image as PillowImage
+
+    if max_bytes < 64 * 1024:
+        raise ValueError("ميزانية صورة الصفحة صغيرة جدًا")
+
+    working = image
+    try:
+        while True:
+            last_output = b""
+            for quality in (86, 76, 66, 56):
+                output = io.BytesIO()
+                working.save(output, "JPEG", quality=quality, optimize=True)
+                last_output = output.getvalue()
+                if len(last_output) <= max_bytes:
+                    return last_output
+
+            width, height = working.size
+            if min(width, height) <= 640:
+                raise GeminiFailure(
+                    "تعذر ضغط صفحة الكتاب إلى حجم آمن من دون الإضرار الشديد بوضوح النص"
+                )
+            shrink = max(0.65, min(0.88, (max_bytes / len(last_output)) ** 0.5 * 0.96))
+            resized = working.resize(
+                (max(640, round(width * shrink)), max(640, round(height * shrink))),
+                resample=PillowImage.Resampling.LANCZOS,
+            )
+            if working is not image:
+                working.close()
+            working = resized
+    finally:
+        if working is not image:
+            working.close()
+
+
+def render_page(
+    path: Path,
+    page_number: int,
+    dpi: int = 160,
+    *,
+    max_bytes: int = MAX_INLINE_IMAGE_BYTES,
+) -> bytes:
     try:
         import pypdfium2 as pdfium
         from PIL import Image
@@ -51,9 +95,10 @@ def render_page(path: Path, page_number: int, dpi: int = 160) -> bytes:
                 bitmap = page.render(scale=max(safe_dpi, 72) / 72)
                 try:
                     image: Image.Image = bitmap.to_pil().convert("RGB")
-                    output = io.BytesIO()
-                    image.save(output, "JPEG", quality=88, optimize=True)
-                    return output.getvalue()
+                    try:
+                        return _encode_jpeg_with_limit(image, max_bytes)
+                    finally:
+                        image.close()
                 finally:
                     bitmap.close()
             finally:
@@ -78,7 +123,7 @@ def render_prompt(
     template: str,
     *,
     file_name: str,
-    page_number: int,
+    page_number: int | str,
     max_pages: int,
     previous: dict[str, Any],
     missing_fields: list[str] | None = None,
@@ -122,17 +167,35 @@ class GeminiCataloguer:
             return
         try:
             from google import genai
+            from google.genai import types
         except ImportError as exc:
             raise RuntimeError("حزمة Google Gen AI غير مثبتة. ثبّت متطلبات التطبيق أولًا") from exc
-        self.client = genai.Client(api_key=self.api_key)
+        self.client = genai.Client(
+            api_key=self.api_key,
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
 
-    def extract(self, image_bytes: bytes, *, model: str, prompt: str) -> ExtractionResult:
+    def extract(
+        self,
+        image_bytes: bytes | Sequence[bytes],
+        *,
+        model: str,
+        prompt: str,
+    ) -> ExtractionResult:
         if not MODEL_PATTERN.fullmatch(model):
             raise ValueError("اسم نموذج Gemini غير صالح")
+        pages = [image_bytes] if isinstance(image_bytes, bytes) else list(image_bytes)
+        if not pages:
+            raise ValueError("يجب إرفاق صورة صفحة واحدة على الأقل")
         try:
             from google.genai import types
 
-            image = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+            images = [
+                types.Part.from_bytes(data=page, mime_type="image/jpeg")
+                for page in pages
+            ]
             config = types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
                 temperature=0,
@@ -142,7 +205,7 @@ class GeminiCataloguer:
             )
             response = self.client.models.generate_content(
                 model=model,
-                contents=[prompt, image],
+                contents=[prompt, *images],
                 config=config,
             )
         except Exception as exc:
