@@ -85,8 +85,15 @@ CREATE TABLE IF NOT EXISTS api_request_reservations (
   model TEXT NOT NULL,
   reserved_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS scan_file_history (
+  path TEXT PRIMARY KEY,
+  folder_path TEXT NOT NULL DEFAULT '',
+  book_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS books_updated ON books(updated_at DESC);
 CREATE INDEX IF NOT EXISTS scan_items_scan ON scan_items(scan_id, position);
+CREATE INDEX IF NOT EXISTS scan_file_history_folder ON scan_file_history(folder_path);
 CREATE INDEX IF NOT EXISTS api_requests_model_time
 ON api_request_reservations(model, reserved_at);
 """
@@ -145,6 +152,16 @@ class Library:
                 )
             db.execute("INSERT OR IGNORE INTO settings VALUES ('model', ?)", (DEFAULT_MODEL,))
             now = utc_now()
+            db.execute(
+                """INSERT OR IGNORE INTO scan_file_history(path,folder_path,book_id,created_at)
+                   SELECT stored_path,'',id,? FROM books WHERE stored_path<>''""",
+                (now,),
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO scan_file_history(path,folder_path,book_id,created_at)
+                   SELECT source_label,'',id,? FROM books WHERE source_label<>''""",
+                (now,),
+            )
             db.execute(
                 "UPDATE scans SET state='interrupted', error='أُغلق التطبيق قبل اكتمال الفحص', updated_at=? WHERE state IN ('running','queued')",
                 (now,),
@@ -212,20 +229,62 @@ class Library:
             self._history(db, book_id, "أُضيف يدويًا")
         return self.get_book(book_id)
 
-    def create_referenced_books(self, entries: list[tuple[Path, int]]) -> list[str]:
+    def processed_source_paths(self) -> set[str]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT path FROM scan_file_history
+                   UNION SELECT stored_path FROM books WHERE stored_path<>''
+                   UNION SELECT source_label FROM books WHERE source_label<>''"""
+            ).fetchall()
+        return {
+            str(Path(row[0]).expanduser().resolve())
+            for row in rows
+            if row[0] and Path(row[0]).expanduser().is_absolute()
+        }
+
+    def create_referenced_books(
+        self,
+        entries: list[tuple[Path, int]],
+        *,
+        folder_root: Path | None = None,
+        skip_processed: bool = False,
+    ) -> list[str]:
         if not entries:
             return []
         now = utc_now()
         book_ids: list[str] = []
         with self.transaction() as db:
             for path, page_count in entries:
+                normalized_path = str(path.expanduser().resolve())
+                if skip_processed:
+                    exists = db.execute(
+                        """SELECT 1 FROM scan_file_history WHERE path=?
+                           UNION SELECT 1 FROM books WHERE stored_path=? OR source_label=?
+                           LIMIT 1""",
+                        (normalized_path, normalized_path, normalized_path),
+                    ).fetchone()
+                    if exists:
+                        continue
                 book_id = uuid.uuid4().hex
                 book_ids.append(book_id)
                 db.execute(
                     """INSERT INTO books
                        (id,title,status,file_name,stored_path,source_label,page_count,created_at,updated_at)
                        VALUES (?,?,'waiting',?,?,?,?,?,?)""",
-                    (book_id, path.stem, path.name, str(path), str(path), page_count, now, now),
+                    (
+                        book_id, path.stem, path.name, normalized_path,
+                        normalized_path, page_count, now, now,
+                    ),
+                )
+                db.execute(
+                    """INSERT OR IGNORE INTO scan_file_history
+                       (path,folder_path,book_id,created_at) VALUES (?,?,?,?)""",
+                    (
+                        normalized_path,
+                        str(folder_root.resolve()) if folder_root else "",
+                        book_id,
+                        now,
+                    ),
                 )
                 self._history(db, book_id, "أُضيف إلى المكتبة وينتظر الفحص")
         return book_ids
@@ -319,6 +378,47 @@ class Library:
                 ),
             )
             self._history(db, book_id, "عُدلت البيانات يدويًا", row["attempts"])
+        return self.get_book(book_id)
+
+    def update_book_path(self, book_id: str, path: Path, page_count: int) -> dict[str, Any]:
+        normalized_path = str(path.expanduser().resolve())
+        now = utc_now()
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT attempts,stored_path,source_label FROM books WHERE id=?",
+                (book_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("الكتاب غير موجود")
+            active = db.execute(
+                """SELECT 1 FROM scan_items si
+                   JOIN scans s ON s.id=si.scan_id
+                   WHERE si.book_id=? AND s.state IN ('queued','running') LIMIT 1""",
+                (book_id,),
+            ).fetchone()
+            if active:
+                raise ValueError("لا يمكن تغيير مسار كتاب موجود في فحص جارٍ. أوقف الفحص أولًا")
+            previous = row["source_label"] or row["stored_path"]
+            if previous == normalized_path:
+                return self.get_book(book_id)
+            previous_path = Path(previous).expanduser() if previous else None
+            if previous_path and previous_path.is_absolute():
+                db.execute(
+                    """INSERT OR IGNORE INTO scan_file_history
+                       (path,folder_path,book_id,created_at) VALUES (?,?,?,?)""",
+                    (str(previous_path.resolve()), "", book_id, now),
+                )
+            db.execute(
+                """UPDATE books SET file_name=?,stored_path=?,source_label=?,page_count=?,
+                   error='',updated_at=? WHERE id=?""",
+                (path.name, normalized_path, normalized_path, page_count, now, book_id),
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO scan_file_history
+                   (path,folder_path,book_id,created_at) VALUES (?,?,?,?)""",
+                (normalized_path, "", book_id, now),
+            )
+            self._history(db, book_id, f"تغير مسار ملف PDF إلى {normalized_path}", row["attempts"])
         return self.get_book(book_id)
 
     def move_books_to_topic(self, book_ids: list[str], topic: str) -> int:

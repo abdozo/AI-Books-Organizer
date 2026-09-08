@@ -15,6 +15,7 @@ from .exporter import build_books_docx
 from .gemini import inspect_pdf
 from .importer import discover_pdfs, local_pdf
 from .models import (
+    BookPathInput,
     BookDeleteInput,
     BookExportInput,
     BookInput,
@@ -113,30 +114,40 @@ def create_app(data_root: Path | None = None, secret_store: SecretStore | None =
         path = local_pdf(payload.path)
         return library.create_referenced_book(path, inspect_pdf(path))
 
-    def folder_paths(payload: LocalFolderInput) -> tuple[Path, list[Path], int]:
+    def folder_paths(payload: LocalFolderInput) -> tuple[Path, list[Path], int, int]:
         return discover_pdfs(
             payload.path,
             include_subfolders=payload.include_subfolders,
             max_depth=payload.max_depth,
             per_folder_limit=payload.per_folder_limit,
+            scan_item_limit=payload.scan_item_limit,
+            excluded_paths=library.processed_source_paths(),
         )
 
     @app.post("/api/imports/folder/preview")
     def preview_folder(payload: LocalFolderInput) -> dict[str, Any]:
-        root, paths, folder_count = folder_paths(payload)
-        return {"path": str(root), "count": len(paths), "folderCount": folder_count}
+        root, paths, folder_count, skipped_count = folder_paths(payload)
+        result = {"path": str(root), "count": len(paths), "folderCount": folder_count}
+        if skipped_count:
+            result["skippedCount"] = skipped_count
+        return result
 
     @app.post("/api/imports/folder", status_code=201)
     def import_folder(payload: LocalFolderInput) -> dict[str, Any]:
-        root, paths, folder_count = folder_paths(payload)
+        root, paths, folder_count, skipped_count = folder_paths(payload)
         entries = [(path, inspect_pdf(path)) for path in paths]
-        book_ids = library.create_referenced_books(entries)
-        return {
+        book_ids = library.create_referenced_books(
+            entries, folder_root=root, skip_processed=True,
+        )
+        result = {
             "path": str(root),
             "count": len(book_ids),
             "folderCount": folder_count,
             "bookIds": book_ids,
         }
+        if skipped_count:
+            result["skippedCount"] = skipped_count
+        return result
 
     @app.post("/api/books/manual", status_code=201)
     def create_manual(payload: BookInput) -> dict[str, Any]:
@@ -155,6 +166,11 @@ def create_app(data_root: Path | None = None, secret_store: SecretStore | None =
     @app.patch("/api/books/{book_id}")
     def update_book(book_id: str, payload: BookInput) -> dict[str, Any]:
         return library.update_book(book_id, payload.model_dump())
+
+    @app.put("/api/books/{book_id}/path")
+    def update_book_path(book_id: str, payload: BookPathInput) -> dict[str, Any]:
+        path = local_pdf(payload.path)
+        return library.update_book_path(book_id, path, inspect_pdf(path))
 
     @app.get("/api/books/{book_id}/pdf", include_in_schema=False)
     def open_pdf(book_id: str) -> FileResponse:

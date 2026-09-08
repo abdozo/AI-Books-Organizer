@@ -534,7 +534,7 @@
     const book = currentBook();
     if (!book) { go("books"); return; }
     $("#routeHost").innerHTML = `
-      <div class="detail-head"><button class="btn btn-icon back" id="backBooks">→</button><div><h1>${esc(book.title)}</h1><p>${esc(book.file)}</p></div><span class="status ${statusClass(book.status)}">${statusLabel(book.status)}</span><div class="actions"><button class="btn" id="openPdf" ${book.pageCount ? "" : "disabled"}>فتح ملف PDF</button><button class="btn" id="openBookFolder" ${book.fullPath ? "" : "disabled"}>فتح المجلد</button><button class="btn" id="moveBookTopic">نقل إلى موضوع</button><button class="btn" id="editBook">تعديل البيانات</button><button class="btn btn-danger" id="deleteBook">حذف الكتاب</button><button class="btn btn-primary" id="rescanBook" ${book.pageCount ? "" : "disabled"}>إعادة توليد البيانات</button></div></div>
+      <div class="detail-head"><button class="btn btn-icon back" id="backBooks">→</button><div><h1>${esc(book.title)}</h1><p>${esc(book.file)}</p></div><span class="status ${statusClass(book.status)}">${statusLabel(book.status)}</span><div class="actions"><button class="btn" id="openPdf" ${book.pageCount ? "" : "disabled"}>فتح ملف PDF</button><button class="btn" id="openBookFolder" ${book.fullPath ? "" : "disabled"}>فتح المجلد</button><button class="btn" id="changeBookPath">تغيير مسار الملف</button><button class="btn" id="moveBookTopic">نقل إلى موضوع</button><button class="btn" id="editBook">تعديل البيانات</button><button class="btn btn-danger" id="deleteBook">حذف الكتاب</button><button class="btn btn-primary" id="rescanBook" ${book.pageCount ? "" : "disabled"}>إعادة توليد البيانات</button></div></div>
       <div class="detail-layout"><section class="card metadata"><div class="metadata-grid">${fields.map(([key, label]) => `<div class="meta-row"><span>${label}</span>${detailMetadataValue(book, key, label)}</div>`).join("")}<div class="meta-row"><span>الثقة</span><strong>${book.confidence}%</strong></div><div class="meta-row"><span>الصفحات المفحوصة</span><strong>${book.pagesChecked} من ${book.maxPages}</strong></div></div><div class="path-box"><strong>المسار الكامل على الجهاز</strong><br>${esc(book.fullPath || "لا يوجد ملف مرتبط بهذا الكتاب")}</div>${book.error ? `<div class="impact missing">${esc(book.error)}</div>` : ""}</section><aside class="card pdf-preview"><div class="pdf-page"><span>صفحة العنوان</span><strong>${esc(book.title)}</strong><span>${esc(book.author || "المؤلف غير معروف")}</span></div></aside></div>`;
     $("#backBooks").onclick = () => go("books");
     $("#openPdf").onclick = () => window.open(`/api/books/${book.id}/pdf`, "_blank", "noopener");
@@ -543,6 +543,26 @@
         await api(`/api/books/${book.id}/folder`, { method: "POST" });
       } catch (error) {
         toast("تعذر فتح المجلد", error.message, "error");
+      }
+    };
+    $("#changeBookPath").onclick = async () => {
+      const button = $("#changeBookPath");
+      button.disabled = true;
+      try {
+        const selected = await api("/api/local-picker/file", { method: "POST" });
+        if (!selected.path) return;
+        await api(`/api/books/${book.id}/path`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: selected.path }),
+        });
+        await refreshData();
+        toast("تغير مسار الملف", selected.path);
+      } catch (error) {
+        toast("تعذر تغيير المسار", error.message, "error");
+      } finally {
+        const currentButton = $("#changeBookPath");
+        if (currentButton) currentButton.disabled = false;
       }
     };
     $("#moveBookTopic").onclick = () => openMoveBooks([book.id]);
@@ -897,6 +917,7 @@
       includeSubfolders,
       maxDepth: includeSubfolders ? Number($("#folderMaxDepth").value) : 0,
       perFolderLimit: Number($("#folderPdfLimit").value),
+      scanItemLimit: Number($("#folderScanItemLimit").value),
     };
   }
   function folderPayload() {
@@ -906,6 +927,7 @@
       include_subfolders: options.includeSubfolders,
       max_depth: options.includeSubfolders ? options.maxDepth : 1,
       per_folder_limit: options.perFolderLimit,
+      scan_item_limit: options.scanItemLimit,
     };
   }
   async function updateFolderSelection() {
@@ -914,11 +936,12 @@
     const options = folderOptions();
     const validDepth = !options.includeSubfolders || (Number.isInteger(options.maxDepth) && options.maxDepth >= 1 && options.maxDepth <= 50);
     const validLimit = Number.isInteger(options.perFolderLimit) && options.perFolderLimit >= 1 && options.perFolderLimit <= 100;
+    const validScanItemLimit = Number.isInteger(options.scanItemLimit) && options.scanItemLimit >= 1 && options.scanItemLimit <= 490;
     pendingFileCount = 0;
     $("#startFolderScanBtn").disabled = true;
     if (!pendingFolder) return;
-    if (!validDepth || !validLimit) {
-      $("#folderSelectionSummary").textContent = "راجع عمق المجلدات والحد الأقصى للملفات.";
+    if (!validDepth || !validLimit || !validScanItemLimit) {
+      $("#folderSelectionSummary").textContent = "راجع عمق المجلدات وحدود الملفات وطابور الفحص.";
       return;
     }
     $("#folderSelectionSummary").textContent = "جارٍ فحص محتويات المجلد...";
@@ -933,9 +956,10 @@
       pendingFileCount = preview.count;
       $("#pendingFolderPath").textContent = preview.path;
       $("#startFolderScanBtn").disabled = !pendingFileCount;
+      const skippedText = preview.skippedCount ? ` سيتجاوز التطبيق ${preview.skippedCount} ملفًا مسجلًا من فحص سابق.` : "";
       $("#folderSelectionSummary").textContent = pendingFileCount
-        ? `سيُفحص ${pendingFileCount} ملف PDF داخل ${preview.folderCount} مجلد.`
-        : "لا توجد ملفات PDF مطابقة لهذه الخيارات.";
+        ? `سيُضاف ${pendingFileCount} سطرًا إلى طابور الفحص داخل ${preview.folderCount} مجلد.${skippedText}`
+        : `لا توجد ملفات PDF جديدة مطابقة لهذه الخيارات.${skippedText}`;
     } catch (error) {
       if (previewSequence !== folderPreviewSequence) return;
       $("#folderSelectionSummary").textContent = error.message;
@@ -1072,11 +1096,13 @@
     $("#includeSubfolders").onchange = updateFolderSelection;
     $("#folderMaxDepth").oninput = updateFolderSelection;
     $("#folderPdfLimit").oninput = updateFolderSelection;
+    $("#folderScanItemLimit").oninput = updateFolderSelection;
     $("#startFolderScanBtn").onclick = async () => {
       const maxPages = readMaxPages("folderMaxPages");
       if (maxPages === null) return;
       if ($("#includeSubfolders").checked && readFolderNumber("folderMaxDepth", 1, 50, "اكتب عمقًا صحيحًا من 1 إلى 50") === null) return;
       if (readFolderNumber("folderPdfLimit", 1, 100, "اكتب عدد ملفات صحيحًا من 1 إلى 100") === null) return;
+      if (readFolderNumber("folderScanItemLimit", 1, 490, "اكتب عدد أسطر صحيحًا من 1 إلى 490") === null) return;
       if (!pendingFileCount) return toast("لا توجد ملفات للفحص", "غيّر خيارات المجلد أو اختر مجلدًا آخر", "error");
       const payload = folderPayload();
       closeModal("folderModal");

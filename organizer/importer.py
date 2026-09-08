@@ -25,7 +25,9 @@ def discover_pdfs(
     include_subfolders: bool,
     max_depth: int,
     per_folder_limit: int,
-) -> tuple[Path, list[Path], int]:
+    scan_item_limit: int = 490,
+    excluded_paths: set[str] | None = None,
+) -> tuple[Path, list[Path], int, int]:
     root = Path(path_value).expanduser()
     if not root.is_absolute():
         raise ValueError("يجب اختيار مجلد من جهازك")
@@ -38,6 +40,8 @@ def discover_pdfs(
 
     selected: list[Path] = []
     folder_count = 0
+    skipped_count = 0
+    excluded = excluded_paths or set()
     for current_value, directories, names in os.walk(root, followlinks=False):
         current = Path(current_value)
         depth = len(current.relative_to(root).parts)
@@ -48,8 +52,18 @@ def discover_pdfs(
             (name for name in names if Path(name).suffix.lower() == ".pdf"),
             key=str.casefold,
         )
-        chosen = pdf_names[:per_folder_limit]
+        available = []
+        for name in pdf_names:
+            candidate = current / name
+            if str(candidate) in excluded:
+                skipped_count += 1
+            else:
+                available.append(candidate)
+        remaining = scan_item_limit - len(selected)
+        chosen = available[:min(per_folder_limit, remaining)]
         if chosen:
             folder_count += 1
-            selected.extend(current / name for name in chosen)
-    return root, selected, folder_count
+            selected.extend(chosen)
+        if len(selected) >= scan_item_limit:
+            break
+    return root, selected, folder_count, skipped_count

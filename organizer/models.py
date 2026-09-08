@@ -244,7 +244,7 @@ class SettingsInput(BaseModel):
 
 
 class ScanInput(BaseModel):
-    book_ids: list[str] = Field(min_length=1, max_length=500)
+    book_ids: list[str] = Field(min_length=1, max_length=490)
     max_pages: int = Field(ge=1, le=100)
 
 
@@ -257,11 +257,16 @@ class LocalFileInput(BaseModel):
         return value.strip()
 
 
+class BookPathInput(LocalFileInput):
+    pass
+
+
 class LocalFolderInput(BaseModel):
     path: str = Field(min_length=1, max_length=4000)
     include_subfolders: bool = True
     max_depth: int = Field(default=10, ge=1, le=50)
     per_folder_limit: int = Field(default=2, ge=1, le=100)
+    scan_item_limit: int = Field(default=490, ge=1, le=490)
 
     @field_validator("path")
     @classmethod

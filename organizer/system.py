@@ -65,7 +65,7 @@ def reveal_in_file_manager(path: Path) -> None:
     if sys.platform == "darwin":
         subprocess.Popen(["open", "-R", str(target)])
     elif os.name == "nt":
-        subprocess.Popen(["explorer", f"/select,{target}"])
+        subprocess.Popen(["explorer", "/select,", str(target)])
     else:
         folder = target if target.is_dir() else target.parent
         subprocess.Popen(["xdg-open", str(folder)])

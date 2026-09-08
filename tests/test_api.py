@@ -181,6 +181,29 @@ def test_book_folder_endpoint_reveals_the_real_path(tmp_path, monkeypatch):
     assert book["fullPath"] == str(pdf)
 
 
+def test_book_pdf_path_can_be_changed_after_the_original_file_moves(tmp_path, monkeypatch):
+    old_pdf = tmp_path / "old.pdf"
+    old_pdf.write_bytes(b"%PDF-old")
+    new_folder = tmp_path / "moved"
+    new_folder.mkdir()
+    new_pdf = new_folder / "renamed.pdf"
+    new_pdf.write_bytes(b"%PDF-new")
+    data_root = tmp_path / "data"
+    client = TestClient(create_app(data_root))
+    monkeypatch.setattr("organizer.main.inspect_pdf", lambda _path: 17)
+    book = client.post("/api/imports/file", json={"path": str(old_pdf)}).json()
+
+    response = client.put(f"/api/books/{book['id']}/path", json={"path": str(new_pdf)})
+
+    assert response.status_code == 200
+    changed = response.json()
+    assert changed["fullPath"] == str(new_pdf)
+    assert changed["file"] == "renamed.pdf"
+    assert changed["pageCount"] == 17
+    assert changed["history"][0]["text"].endswith(str(new_pdf))
+    assert client.get(f"/api/books/{book['id']}/pdf").content == b"%PDF-new"
+
+
 def test_imported_pdf_is_referenced_at_its_original_path_without_copying(tmp_path, monkeypatch):
     source_folder = tmp_path / "library"
     source_folder.mkdir()
@@ -251,3 +274,80 @@ def test_folder_import_discovers_and_references_original_pdfs(tmp_path, monkeypa
     assert {book["fullPath"] for book in books} == {str(first), str(second)}
     assert all(path.startswith(str(root)) for path in (book["fullPath"] for book in books))
     assert list((data_root / "books").rglob("*.pdf")) == []
+
+
+def test_folder_import_stops_at_row_limit_then_resumes_with_unseen_files(tmp_path, monkeypatch):
+    root = tmp_path / "library"
+    root.mkdir()
+    pdfs = [root / f"{index:02}.pdf" for index in range(6)]
+    for pdf in pdfs:
+        pdf.write_bytes(b"%PDF-test")
+    client = TestClient(create_app(tmp_path / "data"))
+    monkeypatch.setattr("organizer.main.inspect_pdf", lambda _path: 3)
+    payload = {
+        "path": str(root),
+        "include_subfolders": False,
+        "max_depth": 1,
+        "per_folder_limit": 100,
+        "scan_item_limit": 2,
+    }
+
+    first = client.post("/api/imports/folder", json=payload)
+    second_preview = client.post("/api/imports/folder/preview", json=payload)
+    second = client.post("/api/imports/folder", json=payload)
+    third = client.post("/api/imports/folder", json=payload)
+    finished = client.post("/api/imports/folder/preview", json=payload)
+
+    assert first.status_code == 201
+    assert first.json()["count"] == 2
+    assert second_preview.json()["count"] == 2
+    assert second_preview.json()["skippedCount"] == 2
+    assert second.json()["count"] == 2
+    assert third.json()["count"] == 2
+    assert finished.json()["count"] == 0
+    assert finished.json()["skippedCount"] == 6
+    books = client.get("/api/bootstrap").json()["books"]
+    assert len(books) == 6
+    assert {book["fullPath"] for book in books} == {str(pdf) for pdf in pdfs}
+
+
+def test_folder_scan_row_limit_cannot_exceed_safety_maximum(tmp_path):
+    root = tmp_path / "library"
+    root.mkdir()
+    client = TestClient(create_app(tmp_path / "data"))
+
+    response = client.post("/api/imports/folder/preview", json={
+        "path": str(root),
+        "scan_item_limit": 491,
+    })
+
+    assert response.status_code == 422
+
+
+def test_folder_preview_defaults_to_490_queue_rows(tmp_path):
+    root = tmp_path / "large-library"
+    root.mkdir()
+    for index in range(495):
+        folder = root / f"{index:03}"
+        folder.mkdir()
+        (folder / "book.pdf").write_bytes(b"%PDF-test")
+    client = TestClient(create_app(tmp_path / "data"))
+
+    response = client.post("/api/imports/folder/preview", json={
+        "path": str(root),
+        "include_subfolders": True,
+        "max_depth": 1,
+        "per_folder_limit": 1,
+    })
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 490
+
+    response = client.post("/api/imports/folder/preview", json={
+        "path": str(root),
+        "include_subfolders": True,
+        "max_depth": 1,
+        "per_folder_limit": 1,
+        "scan_item_limit": 73,
+    })
+    assert response.json()["count"] == 73

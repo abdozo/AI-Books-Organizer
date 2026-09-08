@@ -82,7 +82,7 @@ def test_selected_or_single_books_can_be_deleted_after_confirmation():
     assert "سجل الكتاب" not in source
 
 
-def test_folder_scan_has_depth_and_per_folder_pdf_limits():
+def test_folder_scan_has_depth_and_queue_limits_with_resume():
     html = APP_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
     importer_source = (APP_HTML.parents[0] / "organizer" / "importer.py").read_text(encoding="utf-8")
@@ -90,10 +90,16 @@ def test_folder_scan_has_depth_and_per_folder_pdf_limits():
     assert 'id="includeSubfolders"' in html
     assert 'id="folderMaxDepth"' in html
     assert 'id="folderPdfLimit"' in html
+    assert 'id="folderScanItemLimit"' in html
+    assert 'max="490"' in html
+    assert 'value="490"' in html
     assert 'api("/api/imports/folder/preview"' in source
     assert "include_subfolders: options.includeSubfolders" in source
+    assert "scan_item_limit: options.scanItemLimit" in source
+    assert "preview.skippedCount" in source
     assert "depth >= max_depth" in importer_source
-    assert "pdf_names[:per_folder_limit]" in importer_source
+    assert "available[:min(per_folder_limit, remaining)]" in importer_source
+    assert "candidate) in excluded" in importer_source
 
 
 def test_local_picker_references_original_pdfs_without_browser_uploads():
@@ -121,6 +127,8 @@ def test_scan_ui_reports_rate_limit_buffer_and_book_path_actions():
     assert 'scan?.rateLimitWindow === "day"' in source
     assert "حد الأمان" in source
     assert 'id="openBookFolder"' in source
+    assert 'id="changeBookPath"' in source
+    assert 'api(`/api/books/${book.id}/path`' in source
     assert "book.fullPath" in source
 
 
