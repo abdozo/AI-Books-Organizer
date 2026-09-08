@@ -4,8 +4,8 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WINDOWS_DIR = PROJECT_ROOT / "Windows"
-MACOS_DIR = PROJECT_ROOT / "macOS"
+WINDOWS_DIR = PROJECT_ROOT / "Windows Commands"
+MACOS_DIR = PROJECT_ROOT / "Mac Commands"
 
 
 def test_platform_launchers_are_kept_in_separate_directories():
