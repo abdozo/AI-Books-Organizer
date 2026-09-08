@@ -51,3 +51,12 @@ def test_publication_fields_are_editable_without_archive_routes():
     assert '["edition_number", "رقم الطبعة"]' in source
     assert '["volume_number", "رقم المجلد"]' in source
     assert "publication_year:" not in source.split("const entityTypes =", 1)[1].split("};", 1)[0]
+
+
+def test_scan_queue_links_to_books_and_can_open_all_pages():
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'class="queue-book-link"' in source
+    assert 'href="${bookRouteHref(entry.book_id)}"' in source
+    assert 'id="openAllScanBooks"' in source
+    assert 'window.open(bookRouteHref(bookId), "_blank", "noopener")' in source

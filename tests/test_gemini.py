@@ -4,7 +4,7 @@ import json
 from types import SimpleNamespace
 
 from organizer.gemini import GeminiCataloguer, render_prompt
-from organizer.models import BOOK_REPLY_SCHEMA
+from organizer.models import BOOK_REPLY_SCHEMA, DEFAULT_PROMPT
 
 
 def test_gemini_receives_the_fixed_schema_outside_the_prompt():
@@ -39,13 +39,25 @@ def test_gemini_receives_the_fixed_schema_outside_the_prompt():
 
 def test_prompt_variables_are_replaced_without_appending_json_schema():
     rendered = render_prompt(
-        "{{file_name}} {{page_number}} {{max_pages}} {{previous_results}}",
+        "{{file_name}} {{page_number}} {{max_pages}} {{previous_results}} {{missing_fields}}",
         file_name="book.pdf",
         page_number=2,
         max_pages=5,
         previous={"title": "كتاب"},
+        missing_fields=["publication_year", "edition_number", "volume_number"],
     )
 
     assert rendered.startswith("book.pdf 2 5")
     assert '"title":"كتاب"' in rendered
+    assert "سنة النشر، رقم الطبعة، رقم المجلد" in rendered
     assert "json_schema" not in rendered
+
+
+def test_publication_fields_have_explicit_extraction_guidance():
+    properties = BOOK_REPLY_SCHEMA["properties"]
+
+    assert "١٤٤٣" in properties["publication_year"]["description"]
+    assert "الطبعة الثانية" in properties["edition_number"]["description"]
+    assert "المجلد" in properties["volume_number"]["description"]
+    assert "{{missing_fields}}" in DEFAULT_PROMPT
+    assert "اقرأ جميع النصوص" in DEFAULT_PROMPT

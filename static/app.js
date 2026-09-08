@@ -106,6 +106,10 @@
     location.hash = `#/${route}`;
   }
 
+  function bookRouteHref(bookId) {
+    return `#/book/${encodeURIComponent(bookId)}`;
+  }
+
   function parseRoute() {
     const value = location.hash.replace(/^#\//, "") || "books";
     const root = value.split("/")[0];
@@ -303,8 +307,15 @@
         <div class="extracted">${fields.map(([key, label]) => `<div class="${item[key] ? "" : "active"}"><span>${label}</span><strong class="${item[key] ? "" : "waiting"}">${esc(item[key] || (scan.paused ? "متوقف مؤقتًا" : "جارٍ البحث"))}</strong></div>`).join("")}</div>
         <div class="scan-controls"><button class="btn btn-primary" id="pauseScan">${scan.paused ? "استكمال الفحص" : "إيقاف مؤقت"}</button><button class="btn" id="skipScan">تخطي هذا الكتاب</button><button class="btn btn-danger" id="cancelScan">إنهاء الفحص</button></div>` : `
         <div class="empty scan-empty"><strong>${heading}</strong><span>${scan?.error ? esc(scan.error) : "اختر ملف PDF أو مجلدًا لبدء استخراج بيانات الكتب."}</span><button class="btn btn-primary" data-action="folder">اختيار مجلد</button></div>`}</div></section>
-        <aside class="card"><div class="card-head"><h2>طابور الفحص</h2><small>${scan?.items?.length || 0} كتب</small></div><div class="queue-list">${scan?.items?.length ? scan.items.map((entry, index) => { const current = running && index === scan.currentIndex; return `<div class="queue-row ${current ? "current" : ""}"><span class="queue-num">${index + 1}</span><div><strong>${esc(entry.file)}</strong><small>${current && scan.paused ? "متوقف مؤقتًا" : statusLabel(current ? "current" : entry.state)}</small>${entry.error ? `<small class="missing">${esc(entry.error)}</small>` : ""}</div><span class="queue-state ${statusClass(current ? "current" : entry.state)}"></span></div>`; }).join("") : "<div class=\"empty\">الطابور فارغ</div>"}</div></aside></div>`;
+        <aside class="card"><div class="card-head"><h2>طابور الفحص</h2><div class="card-head-tools"><small>${scan?.items?.length || 0} كتب</small>${scan?.items?.length ? '<button class="link-btn open-all-books" id="openAllScanBooks" type="button">فتح الكل</button>' : ""}</div></div><div class="queue-list">${scan?.items?.length ? scan.items.map((entry, index) => { const current = running && index === scan.currentIndex; const bookName = entry.title || entry.file || "كتاب بلا عنوان"; return `<div class="queue-row ${current ? "current" : ""}"><span class="queue-num">${index + 1}</span><div class="queue-book"><a class="queue-book-link" href="${bookRouteHref(entry.book_id)}" aria-label="فتح صفحة الكتاب: ${esc(bookName)}" title="افتح الصفحة، أو استخدم زر الفأرة الأوسط لفتحها في تبويب جديد">${esc(bookName)}</a>${entry.title && entry.file && entry.title !== entry.file ? `<small class="queue-file">${esc(entry.file)}</small>` : ""}<small>${current && scan.paused ? "متوقف مؤقتًا" : statusLabel(current ? "current" : entry.state)}</small>${entry.error ? `<small class="missing">${esc(entry.error)}</small>` : ""}</div><span class="queue-state ${statusClass(current ? "current" : entry.state)}"></span></div>`; }).join("") : "<div class=\"empty\">الطابور فارغ</div>"}</div></aside></div>`;
     $$("[data-action]").forEach((button) => button.onclick = () => handleAction(button.dataset.action));
+    if (scan?.items?.length) {
+      $("#openAllScanBooks").onclick = () => {
+        const bookIds = [...new Set(scan.items.map((entry) => entry.book_id))];
+        bookIds.forEach((bookId) => window.open(bookRouteHref(bookId), "_blank", "noopener"));
+        toast("فتح صفحات الكتب", `طُلب فتح ${bookIds.length} صفحة. إذا منع المتصفح بعضها، اسمح بالنوافذ المنبثقة لهذا التطبيق.`);
+      };
+    }
     if (item) {
       $("#pauseScan").onclick = () => controlScan(scan.paused ? "resume" : "pause");
       $("#skipScan").onclick = () => controlScan("skip");
