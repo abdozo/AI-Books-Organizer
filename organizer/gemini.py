@@ -20,6 +20,135 @@ class GeminiFailure(RuntimeError):
     pass
 
 
+QUOTA_LABELS = {
+    "rpm": "حد عدد الطلبات في الدقيقة",
+    "tpm": "حد رموز الإدخال في الدقيقة",
+    "rpd": "الحد اليومي لعدد الطلبات",
+    "tpd": "الحد اليومي لرموز الإدخال",
+    "ipm": "حد الصور في الدقيقة",
+    "unknown": "أحد حدود استخدام Gemini",
+}
+QUOTA_PRIORITIES = {
+    "unknown": 0,
+    "rpm": 1,
+    "ipm": 2,
+    "tpm": 3,
+    "rpd": 4,
+    "tpd": 5,
+}
+
+
+class GeminiRateLimit(GeminiFailure):
+    """A structured 429 response returned by the Gemini API."""
+
+    def __init__(
+        self,
+        *,
+        quota_type: str,
+        quota_id: str = "",
+        quota_metric: str = "",
+        retry_after_seconds: float | None = None,
+        provider_message: str = "",
+    ) -> None:
+        self.quota_type = quota_type
+        self.quota_id = quota_id
+        self.quota_metric = quota_metric
+        self.retry_after_seconds = retry_after_seconds
+        self.provider_message = provider_message
+        label = QUOTA_LABELS.get(quota_type, QUOTA_LABELS["unknown"])
+        identifier = quota_id or quota_metric
+        message = f"أعاد Gemini خطأ 429 بسبب بلوغ {label}."
+        if identifier:
+            message += f" معرّف الحصة: {identifier}."
+        if retry_after_seconds is not None:
+            message += f" طلبت Google الانتظار {retry_after_seconds:g} ثانية."
+        if provider_message:
+            message += f" رسالة Google: {provider_message.strip()[:500]}"
+        super().__init__(message)
+
+
+def _quota_type(*values: str) -> str:
+    signal = " ".join(value for value in values if value).lower()
+    compact = re.sub(r"[^a-z0-9]+", "", signal)
+    daily = "perday" in compact or "daily" in compact
+    minute = "perminute" in compact or "minute" in compact
+    if "token" in compact and daily:
+        return "tpd"
+    if "token" in compact and minute:
+        return "tpm"
+    if "image" in compact and minute:
+        return "ipm"
+    if "request" in compact and daily:
+        return "rpd"
+    if "request" in compact and (
+        "perminute" in compact or "persecond" in compact or "minute" in compact
+    ):
+        return "rpm"
+    if daily:
+        return "rpd"
+    return "unknown"
+
+
+def _retry_delay(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    if isinstance(value, str):
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)s\s*", value)
+        return float(match.group(1)) if match else None
+    if isinstance(value, dict):
+        try:
+            return max(
+                0.0,
+                float(value.get("seconds", 0)) + float(value.get("nanos", 0)) / 1_000_000_000,
+            )
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _rate_limit_from_error(exc: Exception, api_key: str) -> GeminiRateLimit | None:
+    if getattr(exc, "code", None) != 429:
+        return None
+    payload = getattr(exc, "details", None)
+    error = payload.get("error", payload) if isinstance(payload, dict) else {}
+    details = error.get("details", []) if isinstance(error, dict) else []
+    provider_message = str(
+        getattr(exc, "message", None) or error.get("message", "") or ""
+    ).replace(api_key, "[API_KEY]")
+    quota_id = ""
+    quota_metric = ""
+    quota_type = "unknown"
+    retry_after_seconds = None
+    for detail in details if isinstance(details, list) else []:
+        if not isinstance(detail, dict):
+            continue
+        detail_type = str(detail.get("@type", ""))
+        if detail_type.endswith("QuotaFailure"):
+            violations = detail.get("violations", [])
+            for violation in violations if isinstance(violations, list) else []:
+                if not isinstance(violation, dict):
+                    continue
+                candidate_id = str(violation.get("quotaId", "") or "")
+                candidate_metric = str(violation.get("quotaMetric", "") or "")
+                candidate_type = _quota_type(candidate_id, candidate_metric, provider_message)
+                if (
+                    not quota_id
+                    or QUOTA_PRIORITIES[candidate_type] > QUOTA_PRIORITIES[quota_type]
+                ):
+                    quota_type = candidate_type
+                    quota_id = candidate_id
+                    quota_metric = candidate_metric
+        elif detail_type.endswith("RetryInfo"):
+            retry_after_seconds = _retry_delay(detail.get("retryDelay"))
+    return GeminiRateLimit(
+        quota_type=quota_type if quota_type != "unknown" else _quota_type(provider_message),
+        quota_id=quota_id,
+        quota_metric=quota_metric,
+        retry_after_seconds=retry_after_seconds,
+        provider_message=provider_message,
+    )
+
+
 def inspect_pdf(source: bytes | Path) -> int:
     try:
         import pypdfium2 as pdfium
@@ -207,6 +336,9 @@ class GeminiCataloguer:
                 config=config,
             )
         except Exception as exc:
+            rate_limit = _rate_limit_from_error(exc, self.api_key)
+            if rate_limit is not None:
+                raise rate_limit from exc
             message = str(exc).replace(self.api_key, "[API_KEY]")
             raise GeminiFailure(message) from exc
         raw = getattr(response, "text", None) or ""

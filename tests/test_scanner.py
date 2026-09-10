@@ -3,8 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from organizer.gemini import GeminiRateLimit
 from organizer.rate_limits import RateLimitReservation
-from organizer.scanner import CATALOG_FIELDS, ScanManager
+from organizer.scanner import CATALOG_FIELDS, ScanManager, provider_quota_wait_seconds
 
 
 class FakeLibrary:
@@ -179,6 +182,107 @@ def test_failed_api_attempt_keeps_its_rate_limit_slot(monkeypatch):
     assert outcome == "failed"
     assert library.api_reservations == 1
     assert library.api_completions == 1
+
+
+def test_provider_tpm_limit_waits_and_retries_the_same_book(monkeypatch):
+    library = FakeLibrary()
+    manager = ScanManager(library, SimpleNamespace())
+    waits = []
+    calls = 0
+    response = extraction({
+        "title": "كتاب", "author": "مؤلف", "publisher": "ناشر", "topic": "تاريخ",
+    })
+
+    monkeypatch.setattr(
+        "organizer.scanner.render_page",
+        lambda _path, page, **_kwargs: str(page).encode(),
+    )
+    manager._wait_for_provider_quota = lambda _scan_id, failure: waits.append(failure) or True
+
+    class Client:
+        def extract(self, _images, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise GeminiRateLimit(
+                    quota_type="tpm",
+                    quota_id="GenerateContentInputTokensPerModelPerMinute-FreeTier",
+                    quota_metric="generativelanguage.googleapis.com/input_token_count",
+                    retry_after_seconds=12,
+                    provider_message="You exceeded your current quota.",
+                )
+            return response
+
+    outcome = manager._scan_book(
+        "scan-1", "book-1", max_pages=1, prompt_template="{{previous_results}}",
+        model="gemini-3.8-flash", client=Client(),
+    )
+
+    assert outcome == "complete"
+    assert calls == 2
+    assert len(waits) == 1
+    assert waits[0].quota_type == "tpm"
+    assert library.api_reservations == 2
+    assert library.api_completions == 2
+
+
+def test_unknown_provider_429_stops_instead_of_retrying_or_advancing(monkeypatch):
+    library = FakeLibrary()
+    manager = ScanManager(library, SimpleNamespace())
+    monkeypatch.setattr(
+        "organizer.scanner.render_page",
+        lambda _path, page, **_kwargs: str(page).encode(),
+    )
+
+    class Client:
+        def extract(self, _images, **_kwargs):
+            raise GeminiRateLimit(
+                quota_type="unknown",
+                provider_message="You exceeded your current quota.",
+            )
+
+    with pytest.raises(GeminiRateLimit):
+        manager._scan_book(
+            "scan-1", "book-1", max_pages=1, prompt_template="{{previous_results}}",
+            model="gemini-3.8-flash", client=Client(),
+        )
+
+    assert library.api_reservations == 1
+    assert library.api_completions == 1
+
+
+def test_provider_retry_delay_gets_a_one_second_safety_margin():
+    failure = GeminiRateLimit(quota_type="rpm", retry_after_seconds=12.5)
+
+    assert provider_quota_wait_seconds(failure) == 13.5
+
+
+def test_provider_wait_exposes_quota_reason_to_the_scan_ui(monkeypatch):
+    library = FakeLibrary()
+    manager = ScanManager(library, SimpleNamespace())
+    monotonic = iter((10.0, 12.0))
+    monkeypatch.setattr("organizer.scanner.time.monotonic", lambda: next(monotonic))
+    monkeypatch.setattr("organizer.scanner.time.time", lambda: 1_000.0)
+    failure = GeminiRateLimit(
+        quota_type="tpm",
+        quota_id="GenerateContentInputTokensPerModelPerMinute-FreeTier",
+        retry_after_seconds=0,
+    )
+
+    assert manager._wait_for_provider_quota("scan-1", failure) is True
+    assert library.scan_updates[0]["buffer_until"] == 1_001_000
+    assert library.scan_updates[0]["rate_limit_window"] == "provider-tpm"
+    assert "رموز الإدخال في الدقيقة" in library.scan_updates[0]["error"]
+    assert library.scan_updates[-1] == {
+        "buffer_until": 0,
+        "rate_limit_window": "",
+        "error": "",
+    }
+
+
+def test_daily_provider_limit_without_retry_info_waits_a_full_day():
+    assert provider_quota_wait_seconds(GeminiRateLimit(quota_type="rpd")) == 86_401
+    assert provider_quota_wait_seconds(GeminiRateLimit(quota_type="tpd")) == 86_401
 
 
 def test_scan_error_identifies_the_book_file(monkeypatch):

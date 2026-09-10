@@ -480,9 +480,12 @@
     const bufferSeconds = running ? Math.max(0, Math.ceil(((scan.bufferUntil || 0) - Date.now()) / 1000)) : 0;
     const buffering = Boolean(bufferSeconds && !scan.paused);
     const quota = state.models.find((model) => model.value === scan?.model);
-    const bufferMessage = scan?.rateLimitWindow === "day"
-      ? `بلغ الفحص الحد اليومي، ${scan.rateLimitRpd || quota?.dailyRequests || 0} طلبًا. سيستأنف تلقائيًا بعد خروج أقدم طلب من نافذة 24 ساعة.`
-      : `بلغ الفحص حد الأمان، ${scan?.rateLimitRpm || quota?.safeRequestsPerMinute || 1} من أصل ${quota?.requestsPerMinute || "الحد المنشور"} طلبات في الدقيقة. سيستأنف تلقائيًا عند توفر طلب جديد.`;
+    const providerLimited = scan?.rateLimitWindow?.startsWith("provider-");
+    const bufferMessage = providerLimited && scan?.error
+      ? scan.error
+      : scan?.rateLimitWindow === "day"
+        ? `بلغ الفحص الحد اليومي، ${scan.rateLimitRpd || quota?.dailyRequests || 0} طلبًا. سيستأنف تلقائيًا بعد خروج أقدم طلب من نافذة 24 ساعة.`
+        : `بلغ الفحص حد الأمان، ${scan?.rateLimitRpm || quota?.safeRequestsPerMinute || 1} من أصل ${quota?.requestsPerMinute || "الحد المنشور"} طلبات في الدقيقة. سيستأنف تلقائيًا عند توفر طلب جديد.`;
     const heading = running ? (scan.paused ? "الفحص متوقف مؤقتًا" : buffering ? "انتظار حصة API" : "الكتاب الحالي")
       : scan?.state === "cancelled" ? "أُوقف الفحص"
         : scan?.state === "failed" ? "تعذر إكمال الفحص"

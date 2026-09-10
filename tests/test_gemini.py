@@ -4,10 +4,19 @@ import json
 from types import SimpleNamespace
 
 from google import genai
+from google.genai import errors
 from PIL import Image
 import pypdfium2 as pdfium
+import pytest
 
-from organizer.gemini import GeminiCataloguer, _encode_jpeg_with_limit, inspect_pdf, render_prompt
+from organizer.gemini import (
+    GeminiCataloguer,
+    GeminiRateLimit,
+    _encode_jpeg_with_limit,
+    _quota_type,
+    inspect_pdf,
+    render_prompt,
+)
 from organizer.models import BOOK_REPLY_SCHEMA, DEFAULT_PROMPT
 
 
@@ -25,6 +34,69 @@ def test_gemini_client_disables_automatic_http_retries(monkeypatch):
 
     assert cataloguer.client is fake_client
     assert captured["http_options"].retry_options.attempts == 1
+
+
+def test_gemini_429_preserves_tpm_quota_details_and_retry_delay():
+    response_json = {
+        "error": {
+            "code": 429,
+            "message": "You exceeded your current quota.",
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [
+                        {
+                            "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                            "quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                        },
+                        {
+                            "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_input_token_count",
+                            "quotaId": "GenerateContentInputTokensPerModelPerMinute-FreeTier",
+                            "quotaDimensions": {"model": "gemini-test", "location": "global"},
+                            "quotaValue": "250000",
+                        }
+                    ],
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "42s",
+                },
+            ],
+        }
+    }
+
+    def reject(**_kwargs):
+        raise errors.ClientError(429, response_json)
+
+    client = GeminiCataloguer(
+        "secret-key",
+        client=SimpleNamespace(models=SimpleNamespace(generate_content=reject)),
+    )
+
+    with pytest.raises(GeminiRateLimit) as captured:
+        client.extract(b"page", model="gemini-test", prompt="extract")
+
+    failure = captured.value
+    assert failure.quota_type == "tpm"
+    assert failure.quota_id == "GenerateContentInputTokensPerModelPerMinute-FreeTier"
+    assert failure.quota_metric.endswith("input_token_count")
+    assert failure.retry_after_seconds == 42
+    assert "رموز الإدخال في الدقيقة" in str(failure)
+
+
+@pytest.mark.parametrize(
+    ("quota_id", "expected"),
+    (
+        ("GenerateRequestsPerMinutePerProjectPerModel-FreeTier", "rpm"),
+        ("GenerateContentInputTokensPerModelPerMinute-FreeTier", "tpm"),
+        ("GenerateRequestsPerDayPerProjectPerModel-FreeTier", "rpd"),
+        ("GenerateContentInputTokensPerModelPerDay-FreeTier", "tpd"),
+        ("GenerateImagesPerMinutePerProjectPerModel-FreeTier", "ipm"),
+    ),
+)
+def test_quota_ids_are_classified_by_their_google_window(quota_id, expected):
+    assert _quota_type(quota_id) == expected
 
 
 def test_rendered_page_is_compressed_to_its_request_budget():

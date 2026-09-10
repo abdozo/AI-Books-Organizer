@@ -125,6 +125,7 @@ def test_scan_ui_reports_rate_limit_buffer_and_book_path_actions():
     assert "scan.bufferUntil" in source
     assert "انتظار حصة API" in source
     assert 'scan?.rateLimitWindow === "day"' in source
+    assert 'scan?.rateLimitWindow?.startsWith("provider-")' in source
     assert "حد الأمان" in source
     assert 'id="openBookFolder"' in source
     assert 'id="changeBookPath"' in source
