@@ -132,3 +132,24 @@ def test_completed_requests_keep_their_slots_from_expiring_before_google_saw_the
 
     now[0] = 400_060.8
     assert limiter.reserve("gemini-3.5-flash-lite").wait_seconds == 0
+
+
+def test_provider_cooldown_is_persistent_and_cannot_be_shortened(tmp_path):
+    now = [500_000.0]
+    library = Library(tmp_path)
+    limiter = PersistentRateLimiter(library, clock=lambda: now[0])
+    limiter.defer("gemini-3.8-flash", 120, "provider-rpm")
+    now[0] += 10
+    restarted = PersistentRateLimiter(Library(tmp_path), clock=lambda: now[0])
+    restarted.defer("gemini-3.8-flash", 5, "provider-tpm")
+
+    blocked = restarted.reserve("gemini-3.8-flash")
+    assert blocked.wait_seconds == 110
+    assert blocked.window == "provider-rpm"
+    assert blocked.reservation_id is None
+    assert restarted.reserve("gemini-2.5-flash").wait_seconds == 0
+
+    now[0] += 109.5
+    assert restarted.reserve("gemini-3.8-flash").wait_seconds == 0.5
+    now[0] += 0.5
+    assert restarted.reserve("gemini-3.8-flash").wait_seconds == 0

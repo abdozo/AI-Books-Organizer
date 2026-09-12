@@ -20,6 +20,10 @@ class GeminiFailure(RuntimeError):
     pass
 
 
+class GeminiAuthenticationFailure(GeminiFailure):
+    """An account or permission failure that must stop the whole scan queue."""
+
+
 QUOTA_LABELS = {
     "rpm": "حد عدد الطلبات في الدقيقة",
     "tpm": "حد رموز الإدخال في الدقيقة",
@@ -336,6 +340,14 @@ class GeminiCataloguer:
                 config=config,
             )
         except Exception as exc:
+            if getattr(exc, "code", None) in {401, 403}:
+                message = str(exc).replace(self.api_key, "[API_KEY]")
+                raise GeminiAuthenticationFailure(
+                    "أُوقف الفحص لأن Google رفضت المصادقة أو صلاحيات الوصول. "
+                    "تحقق من أن حساب الخدمة المرتبط بالمفتاح نشط ومن صلاحيات المشروع "
+                    "قبل إعادة الفحص. هذا الخطأ لا يثبت بلوغ حد الاستخدام. "
+                    f"رسالة Google: {message}"
+                ) from exc
             rate_limit = _rate_limit_from_error(exc, self.api_key)
             if rate_limit is not None:
                 raise rate_limit from exc

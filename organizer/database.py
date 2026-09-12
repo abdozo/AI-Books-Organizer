@@ -85,6 +85,11 @@ CREATE TABLE IF NOT EXISTS api_request_reservations (
   model TEXT NOT NULL,
   reserved_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS api_model_cooldowns (
+  model TEXT PRIMARY KEY,
+  blocked_until REAL NOT NULL,
+  window TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS scan_file_history (
   path TEXT PRIMARY KEY,
   folder_path TEXT NOT NULL DEFAULT '',
@@ -568,15 +573,34 @@ class Library:
                 if len(request_times) >= day_limit
                 else 0.0
             )
-            wait_seconds = max(minute_wait, day_wait)
+            cooldown = db.execute(
+                "SELECT blocked_until,window FROM api_model_cooldowns WHERE model=?",
+                (model,),
+            ).fetchone()
+            provider_wait = max(0.0, cooldown["blocked_until"] - reserved_at) if cooldown else 0.0
+            wait_seconds = max(minute_wait, day_wait, provider_wait)
             if wait_seconds > 0:
-                window = "day" if day_wait >= minute_wait else "minute"
+                if provider_wait >= max(minute_wait, day_wait):
+                    window = cooldown["window"]
+                else:
+                    window = "day" if day_wait >= minute_wait else "minute"
                 return wait_seconds, window, len(minute_times), len(request_times), None
             cursor = db.execute(
                 "INSERT INTO api_request_reservations(model,reserved_at) VALUES (?,?)",
                 (model, reserved_at),
             )
             return 0.0, "", len(minute_times) + 1, len(request_times) + 1, int(cursor.lastrowid)
+
+    def defer_api_requests(self, model: str, *, blocked_until: float, window: str) -> None:
+        """Persist a model-wide stop period; a shorter delay cannot clear it."""
+        with self.transaction() as db:
+            db.execute(
+                """INSERT INTO api_model_cooldowns(model,blocked_until,window) VALUES (?,?,?)
+                   ON CONFLICT(model) DO UPDATE SET
+                     blocked_until=excluded.blocked_until, window=excluded.window
+                   WHERE excluded.blocked_until > api_model_cooldowns.blocked_until""",
+                (model, blocked_until, window),
+            )
 
     def complete_api_request(self, reservation_id: int, *, completed_at: float) -> None:
         """Keep a request counted until at least the time its response completed."""

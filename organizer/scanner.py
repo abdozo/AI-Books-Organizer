@@ -8,6 +8,7 @@ from typing import Any
 from .database import Library
 from .gemini import (
     MAX_INLINE_IMAGE_BYTES,
+    GeminiAuthenticationFailure,
     GeminiCataloguer,
     GeminiRateLimit,
     render_page,
@@ -22,6 +23,7 @@ CATALOG_FIELDS = (
     "edition_number", "volume_number", "topic",
 )
 PROVIDER_RETRY_SAFETY_SECONDS = 1.0
+MAX_PROVIDER_QUOTA_RETRIES = 2
 
 
 def overall_confidence(values: dict[str, str], scores: dict[str, int]) -> int:
@@ -29,13 +31,14 @@ def overall_confidence(values: dict[str, str], scores: dict[str, int]) -> int:
     return round(sum(populated_scores) / len(populated_scores)) if populated_scores else 0
 
 
-def provider_quota_wait_seconds(failure: GeminiRateLimit) -> float:
-    """Honor Google's retry delay, with a safe fallback for each quota window."""
-    if failure.retry_after_seconds is not None:
-        return max(1.0, failure.retry_after_seconds + PROVIDER_RETRY_SAFETY_SECONDS)
+def provider_quota_wait_seconds(failure: GeminiRateLimit, retry_number: int = 1) -> float:
+    """Honor Google's delay and back off for at least one quota window."""
     if failure.quota_type in {"rpd", "tpd"}:
-        return 24 * 60 * 60 + PROVIDER_RETRY_SAFETY_SECONDS
-    return 60.0 + PROVIDER_RETRY_SAFETY_SECONDS
+        minimum = 24 * 60 * 60.0
+    else:
+        minimum = 60.0
+    backoff = minimum * 2 ** (retry_number - 1)
+    return max(backoff, failure.retry_after_seconds or 0.0) + PROVIDER_RETRY_SAFETY_SECONDS
 
 
 class ScanManager:
@@ -78,6 +81,11 @@ class ScanManager:
     ) -> RateLimitReservation | None:
         """Wait for this model's rolling minute or day quota."""
         while True:
+            if not self._wait_if_paused(scan_id):
+                return None
+            control = self._control(scan_id)
+            if control["cancelRequested"] or control["skipRequested"]:
+                return None
             reservation = self._rate_limiter.reserve(model)
             delay = reservation.wait_seconds
             limit_fields = {
@@ -113,9 +121,10 @@ class ScanManager:
         self,
         scan_id: str,
         failure: GeminiRateLimit,
+        retry_number: int = 1,
     ) -> bool:
         """Stop the queue after a provider 429 and retry the same request later."""
-        delay = provider_quota_wait_seconds(failure)
+        delay = provider_quota_wait_seconds(failure, retry_number)
         deadline = time.monotonic() + delay
         self.library.update_scan(
             scan_id,
@@ -252,6 +261,7 @@ class ScanManager:
                 previous=previous,
                 missing_fields=missing_fields,
             )
+            quota_retries = 0
             while True:
                 reservation = self._wait_for_api_slot(scan_id, model)
                 if reservation is None:
@@ -263,13 +273,30 @@ class ScanManager:
                     return "waiting"
                 try:
                     try:
+                        # Controls may change while reserving the slot. Never hold
+                        # an old reservation through a pause and send with it later.
+                        control = self._control(scan_id)
+                        if control["cancelRequested"]:
+                            return "waiting"
+                        if control["skipRequested"]:
+                            self.library.mark_book_skipped(book_id, max_pages)
+                            self.library.update_scan(scan_id, skip_requested=0)
+                            return "skipped"
+                        if control["paused"]:
+                            continue
                         result = client.extract(images, model=model, prompt=prompt)
                     finally:
                         self._rate_limiter.complete(reservation)
                 except GeminiRateLimit as failure:
-                    if failure.quota_type == "unknown":
+                    self._rate_limiter.defer(
+                        model,
+                        provider_quota_wait_seconds(failure, quota_retries + 1),
+                        f"provider-{failure.quota_type}",
+                    )
+                    if failure.quota_type == "unknown" or quota_retries >= MAX_PROVIDER_QUOTA_RETRIES:
                         raise
-                    if not self._wait_for_provider_quota(scan_id, failure):
+                    quota_retries += 1
+                    if not self._wait_for_provider_quota(scan_id, failure, quota_retries):
                         control = self._control(scan_id)
                         if control["skipRequested"]:
                             self.library.mark_book_skipped(book_id, max_pages)
@@ -296,6 +323,9 @@ class ScanManager:
             )
             final_book = self.library.get_book(book_id)
             return final_book["status"]
+        except GeminiAuthenticationFailure as exc:
+            file_label = book.get("file") or book.get("title") or book_id
+            raise GeminiAuthenticationFailure(f'تعذر فحص "{file_label}": {exc}') from exc
         except GeminiRateLimit:
             raise
         except Exception as exc:

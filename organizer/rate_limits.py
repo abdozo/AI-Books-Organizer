@@ -126,3 +126,9 @@ class PersistentRateLimiter:
             reservation.reservation_id,
             completed_at=self._clock(),
         )
+
+    def defer(self, model: str, seconds: float, window: str) -> None:
+        """Keep provider cooldowns across books, scans, and application restarts."""
+        self._library.defer_api_requests(
+            model, blocked_until=self._clock() + seconds, window=window,
+        )

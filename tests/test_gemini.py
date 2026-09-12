@@ -10,6 +10,7 @@ import pypdfium2 as pdfium
 import pytest
 
 from organizer.gemini import (
+    GeminiAuthenticationFailure,
     GeminiCataloguer,
     GeminiRateLimit,
     _encode_jpeg_with_limit,
@@ -34,6 +35,24 @@ def test_gemini_client_disables_automatic_http_retries(monkeypatch):
 
     assert cataloguer.client is fake_client
     assert captured["http_options"].retry_options.attempts == 1
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_authentication_failure_redacts_key_and_explains_account_check(code):
+    def reject(**_kwargs):
+        raise errors.ClientError(code, {"error": {
+            "code": code, "message": "Rejected secret-key", "status": "UNAUTHENTICATED",
+        }})
+
+    client = GeminiCataloguer("secret-key", client=SimpleNamespace(
+        models=SimpleNamespace(generate_content=reject),
+    ))
+    with pytest.raises(GeminiAuthenticationFailure) as captured:
+        client.extract(b"page", model="gemini-test", prompt="extract")
+
+    assert "secret-key" not in str(captured.value)
+    assert "[API_KEY]" in str(captured.value)
+    assert "حساب الخدمة" in str(captured.value)
 
 
 def test_gemini_429_preserves_tpm_quota_details_and_retry_delay():

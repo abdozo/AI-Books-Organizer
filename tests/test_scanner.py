@@ -4,8 +4,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from google.genai import errors
 
-from organizer.gemini import GeminiRateLimit
+from organizer.database import Library
+from organizer.gemini import GeminiCataloguer, GeminiRateLimit
 from organizer.rate_limits import RateLimitReservation
 from organizer.scanner import CATALOG_FIELDS, ScanManager, provider_quota_wait_seconds
 
@@ -56,6 +58,9 @@ class FakeLibrary:
     def complete_api_request(self, _reservation_id: int, **_kwargs):
         self.api_completions += 1
 
+    def defer_api_requests(self, _model: str, **_kwargs):
+        pass
+
 
 def extraction(values: dict[str, str]):
     complete_values = {field: values.get(field, "") for field in CATALOG_FIELDS}
@@ -70,9 +75,9 @@ def extraction(values: dict[str, str]):
     return SimpleNamespace(data=response)
 
 
-def test_daily_wait_is_reported_and_skip_stays_responsive():
+def test_daily_wait_is_reported_and_skip_stays_responsive(monkeypatch):
     library = FakeLibrary()
-    library.skip_requested = True
+    monkeypatch.setattr("organizer.scanner.time.sleep", lambda _delay: setattr(library, "skip_requested", True))
     manager = ScanManager(library, SimpleNamespace())
     manager._rate_limiter = SimpleNamespace(reserve=lambda _model: RateLimitReservation(
         wait_seconds=3600,
@@ -197,7 +202,7 @@ def test_provider_tpm_limit_waits_and_retries_the_same_book(monkeypatch):
         "organizer.scanner.render_page",
         lambda _path, page, **_kwargs: str(page).encode(),
     )
-    manager._wait_for_provider_quota = lambda _scan_id, failure: waits.append(failure) or True
+    manager._wait_for_provider_quota = lambda _scan_id, failure, _retry: waits.append(failure) or True
 
     class Client:
         def extract(self, _images, **_kwargs):
@@ -251,16 +256,20 @@ def test_unknown_provider_429_stops_instead_of_retrying_or_advancing(monkeypatch
     assert library.api_completions == 1
 
 
-def test_provider_retry_delay_gets_a_one_second_safety_margin():
+def test_provider_retry_delay_never_shortens_the_minute_backoff():
     failure = GeminiRateLimit(quota_type="rpm", retry_after_seconds=12.5)
 
-    assert provider_quota_wait_seconds(failure) == 13.5
+    assert provider_quota_wait_seconds(failure) == 61
+    assert provider_quota_wait_seconds(failure, retry_number=2) == 121
+    assert provider_quota_wait_seconds(
+        GeminiRateLimit(quota_type="rpm", retry_after_seconds=150),
+    ) == 151
 
 
 def test_provider_wait_exposes_quota_reason_to_the_scan_ui(monkeypatch):
     library = FakeLibrary()
     manager = ScanManager(library, SimpleNamespace())
-    monotonic = iter((10.0, 12.0))
+    monotonic = iter((10.0, 72.0))
     monkeypatch.setattr("organizer.scanner.time.monotonic", lambda: next(monotonic))
     monkeypatch.setattr("organizer.scanner.time.time", lambda: 1_000.0)
     failure = GeminiRateLimit(
@@ -270,7 +279,7 @@ def test_provider_wait_exposes_quota_reason_to_the_scan_ui(monkeypatch):
     )
 
     assert manager._wait_for_provider_quota("scan-1", failure) is True
-    assert library.scan_updates[0]["buffer_until"] == 1_001_000
+    assert library.scan_updates[0]["buffer_until"] == 1_061_000
     assert library.scan_updates[0]["rate_limit_window"] == "provider-tpm"
     assert "رموز الإدخال في الدقيقة" in library.scan_updates[0]["error"]
     assert library.scan_updates[-1] == {
@@ -283,6 +292,12 @@ def test_provider_wait_exposes_quota_reason_to_the_scan_ui(monkeypatch):
 def test_daily_provider_limit_without_retry_info_waits_a_full_day():
     assert provider_quota_wait_seconds(GeminiRateLimit(quota_type="rpd")) == 86_401
     assert provider_quota_wait_seconds(GeminiRateLimit(quota_type="tpd")) == 86_401
+
+
+def test_short_provider_delay_does_not_repeatedly_retry_a_daily_limit():
+    failure = GeminiRateLimit(quota_type="rpd", retry_after_seconds=5)
+    assert provider_quota_wait_seconds(failure) == 86_401
+    assert provider_quota_wait_seconds(failure, retry_number=2) == 172_801
 
 
 def test_scan_error_identifies_the_book_file(monkeypatch):
@@ -303,3 +318,71 @@ def test_scan_error_identifies_the_book_file(monkeypatch):
 
     assert outcome == "failed"
     assert saved_results[0]["error"] == 'تعذر فحص "book.pdf": الصفحة تالفة'
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_rejected_account_stops_entire_queue_after_one_request(tmp_path, monkeypatch, code):
+    library = Library(tmp_path / "data")
+    books = []
+    for filename in ("الحب في الميزان.pdf", "next.pdf"):
+        path = tmp_path / filename
+        path.write_bytes(b"%PDF-test")
+        books.append(library.create_referenced_book(path, 1))
+    scan_id = library.create_scan([book["id"] for book in books], 1, model="gemini-3.8-flash")
+    calls = []
+
+    def reject(**kwargs):
+        calls.append(kwargs)
+        raise errors.ClientError(code, {"error": {
+            "code": code,
+            "message": "The bound service account is deleted or disabled. "
+                       "The service account bound to the API key must be active.",
+            "status": "UNAUTHENTICATED" if code == 401 else "PERMISSION_DENIED",
+            "details": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "ACCOUNT_STATE_INVALID",
+                "metadata": {"service": "generativelanguage.googleapis.com"},
+            }],
+        }})
+
+    client = GeminiCataloguer("test-key", client=SimpleNamespace(
+        models=SimpleNamespace(generate_content=reject),
+    ))
+    monkeypatch.setattr("organizer.scanner.GeminiCataloguer", lambda _key: client)
+    monkeypatch.setattr("organizer.scanner.render_page", lambda *_args, **_kwargs: b"page")
+    manager = ScanManager(library, SimpleNamespace(get=lambda: "test-key"))
+
+    manager._run(scan_id)
+
+    assert len(calls) == 1
+    assert library.latest_scan()["state"] == "failed"
+    assert "ACCOUNT_STATE_INVALID" in library.latest_scan()["error"]
+    assert library.scan_items(scan_id)[1]["state"] == "waiting"
+    assert library.get_book(books[1]["id"])["status"] == "waiting"
+
+
+def test_repeated_known_quota_errors_stop_after_three_attempts(monkeypatch):
+    library = FakeLibrary()
+    manager = ScanManager(library, SimpleNamespace())
+    monkeypatch.setattr("organizer.scanner.render_page", lambda *_args, **_kwargs: b"page")
+    waits = []
+    manager._wait_for_provider_quota = lambda *args: waits.append(args) or True
+    calls = []
+
+    class Client:
+        def extract(self, *_args, **_kwargs):
+            calls.append(True)
+            if len(calls) <= 3:
+                raise GeminiRateLimit(quota_type="tpm", retry_after_seconds=1)
+            return extraction({"title": "book"})
+
+    with pytest.raises(GeminiRateLimit):
+        manager._scan_book(
+            "scan-1", "book-1", max_pages=1, prompt_template="extract",
+            model="gemini-3.8-flash", client=Client(),
+        )
+
+    assert len(calls) == 3
+    assert len(waits) == 2
+    assert library.api_reservations == 3
+    assert library.api_completions == 3
